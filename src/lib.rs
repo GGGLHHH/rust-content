@@ -31,7 +31,7 @@ pub use repo::{
     ContentRepo, InMemoryContentRepo, InMemoryObjectRepo, NewContent, NewObject, ObjectRepo,
     PgContentRepo, PgObjectRepo,
 };
-pub use service::{ContentService, ContentServiceBuilder, UploadOutcome};
+pub use service::{ContentService, ContentServiceBuilder, Preview, UploadOutcome};
 pub use status::{ContentStatus, ObjectStatus};
 pub use store::{InMemoryObjectStore, ObjectMeta, ObjectStore, UploadParams};
 pub use types::{Content, ContentMetadata, DerivedContent, Object, ObjectMetadata};

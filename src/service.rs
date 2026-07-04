@@ -24,6 +24,15 @@ pub struct UploadOutcome {
     pub object: Object,
 }
 
+/// 展示用表示:字节 + **怎么展示它的说明书**。
+/// 前端/HTTP 边界按 `metadata.mime_type` 决定渲染(<img>/<video>/pdf)与 Content-Type;
+/// `download_content` 保持裸 Bytes(存盘语义,要元数据自己查)—— 两者的又一领域区别。
+pub struct Preview {
+    pub data: Bytes,
+    /// 未同步过元数据 → `None`,调用方兜底(application/octet-stream)。
+    pub metadata: Option<ContentMetadata>,
+}
+
 /// 内容服务。`Clone` 廉价(全是 Arc),app 直接持有它(放进 `AppState`)。
 #[derive(Clone)]
 pub struct ContentService {
@@ -282,6 +291,28 @@ impl ContentService {
         self.inner.store.download(&target.object_key).await
     }
 
+    /// 预览内容(展示用):字节 + 元数据说明书。状态闸与对象选择**同 download**
+    /// ("可展示"=="可下载",同一生命周期约束)。
+    /// DEFER:派生编排落地后,这里优先取 variant="preview" 的派生对象(缩略图/poster),
+    /// 签名不变、调用方零改动 —— 签名就是为那天设计的。
+    pub async fn preview_content(&self, content_id: Uuid) -> Result<Preview, ContentError> {
+        let content = self.inner.contents.get(content_id).await?;
+        can_download_content(content.status)?;
+        let objects = self.inner.objects.list_by_content(content_id).await?;
+        let target = objects
+            .into_iter()
+            .find(|o| o.status == ObjectStatus::Uploaded)
+            .ok_or(ContentError::NotFound)?;
+        let data = self.inner.store.download(&target.object_key).await?;
+        // 元数据缺失(未同步)容忍为 None;其余错误上抛。
+        let metadata = match self.inner.contents.get_metadata(content_id).await {
+            Ok(m) => Some(m),
+            Err(ContentError::NotFound) => None,
+            Err(e) => return Err(e),
+        };
+        Ok(Preview { data, metadata })
+    }
+
     /// 设置内容元数据(全量替换,upsert)。先验内容存在 → `NotFound`。
     pub async fn set_content_metadata(
         &self,
@@ -484,5 +515,49 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(store.preview_url("k").await.unwrap().is_none());
+    }
+
+    /// preview = 字节 + 展示说明书:字节同 download,metadata 里 mime/file_name 可直接填 HTTP 头。
+    #[tokio::test]
+    async fn preview_returns_bytes_with_metadata() {
+        let svc = svc();
+        let out = svc
+            .upload_content(upload_input(b"img-bytes"), Some("sys".into()))
+            .await
+            .unwrap();
+        let p = svc.preview_content(out.content.id).await.unwrap();
+        assert_eq!(&p.data[..], b"img-bytes");
+        let meta = p.metadata.expect("upload 已同步元数据");
+        assert_eq!(meta.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(meta.file_name.as_deref(), Some("doc.txt"));
+    }
+
+    /// 状态闸与 download 同一把:未上传(created)→ NotReady;不存在 → NotFound。
+    #[tokio::test]
+    async fn preview_guards_match_download() {
+        let svc = svc();
+        let c = svc
+            .create_content(
+                CreateContentInput {
+                    tenant_id: Uuid::now_v7(),
+                    owner_id: Uuid::now_v7(),
+                    owner_type: None,
+                    name: None,
+                    description: None,
+                    document_type: None,
+                    derivation_type: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            svc.preview_content(c.id).await,
+            Err(ContentError::NotReady(_))
+        ));
+        assert!(matches!(
+            svc.preview_content(Uuid::now_v7()).await,
+            Err(ContentError::NotFound)
+        ));
     }
 }
