@@ -49,7 +49,27 @@ pub trait ObjectStore: Send + Sync {
     /// 读后端侧元数据(size/etag/content-type)。
     async fn object_meta(&self, object_key: &str) -> Result<ObjectMeta, ContentError>;
 
-    // DEFER:get_upload_url / get_download_url / get_preview_url(预签名 URL)。
+    /// 客户端直传用的预签名上传 URL。`Ok(None)` = 后端不支持(**能力缺省,非错误**);
+    /// presign 真失败(网络/凭据)→ `Err(Storage)`,两者可判别。直传编排(create→presign→confirm)DEFER。
+    async fn upload_url(&self, _object_key: &str) -> Result<Option<String>, ContentError> {
+        Ok(None)
+    }
+
+    /// 预签名下载 URL,**attachment 语义**:带 `download_filename` 时实现方应把
+    /// `Content-Disposition: attachment; filename="..."` 钉进签名(S3 ResponseContentDisposition)。
+    async fn download_url(
+        &self,
+        _object_key: &str,
+        _download_filename: Option<&str>,
+    ) -> Result<Option<String>, ContentError> {
+        Ok(None)
+    }
+
+    /// 预签名预览 URL,**inline 语义**(浏览器直接渲染)。与 download_url 的区别就在
+    /// 签进 URL 的 disposition —— 领域区别,不是 HTTP 层装饰。
+    async fn preview_url(&self, _object_key: &str) -> Result<Option<String>, ContentError> {
+        Ok(None)
+    }
 }
 
 /// 库内默认实现:进程内内存后端(脚手架零 DB 跑通)。生产 minio/S3 由 app 注入。

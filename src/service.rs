@@ -473,4 +473,16 @@ mod tests {
             Err(ContentError::NotReady(_))
         ));
     }
+    /// URL 是可选能力:memory 后端不支持 presign → Ok(None)(非错误;调用方回退字节代理)。
+    #[tokio::test]
+    async fn memory_store_presign_urls_are_none() {
+        let store = InMemoryObjectStore::new();
+        assert!(store.upload_url("k").await.unwrap().is_none());
+        assert!(store
+            .download_url("k", Some("f.txt"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store.preview_url("k").await.unwrap().is_none());
+    }
 }
