@@ -303,12 +303,20 @@ impl ContentService {
         self.inner.store.preview_url(&target.object_key).await
     }
 
-    /// 预签名下载 URL(attachment,filename 取 object 行 —— 最近源)。`Ok(None)` 同上回退。
+    /// 预签名下载 URL(attachment)。`Ok(None)` 同上回退。
+    /// filename **优先 content_metadata**(经 set_content_metadata 可编辑 —— 用户改名后签新名),
+    /// 回退 object 行(建行时的原始名,之后不可变)。
     pub async fn download_url(&self, content_id: Uuid) -> Result<Option<String>, ContentError> {
         let target = self.primary_object(content_id).await?;
+        let meta_name = match self.inner.contents.get_metadata(content_id).await {
+            Ok(m) => m.file_name,
+            Err(ContentError::NotFound) => None,
+            Err(e) => return Err(e),
+        };
+        let filename = meta_name.or(target.file_name);
         self.inner
             .store
-            .download_url(&target.object_key, target.file_name.as_deref())
+            .download_url(&target.object_key, filename.as_deref())
             .await
     }
 
@@ -584,5 +592,136 @@ mod tests {
             svc.preview_url(Uuid::now_v7()).await,
             Err(ContentError::NotFound)
         ));
+    }
+
+    /// 契约测试用 store:覆写 URL 方法(字节走内存实现)—— 钉住 Some 回传 + filename 透传。
+    struct FixedUrlStore(InMemoryObjectStore);
+
+    #[async_trait::async_trait]
+    impl crate::store::ObjectStore for FixedUrlStore {
+        async fn upload(&self, params: UploadParams, data: Bytes) -> Result<(), ContentError> {
+            self.0.upload(params, data).await
+        }
+        async fn download(&self, object_key: &str) -> Result<Bytes, ContentError> {
+            self.0.download(object_key).await
+        }
+        async fn delete(&self, object_key: &str) -> Result<(), ContentError> {
+            self.0.delete(object_key).await
+        }
+        async fn object_meta(
+            &self,
+            object_key: &str,
+        ) -> Result<crate::store::ObjectMeta, ContentError> {
+            self.0.object_meta(object_key).await
+        }
+        async fn download_url(
+            &self,
+            object_key: &str,
+            download_filename: Option<&str>,
+        ) -> Result<Option<String>, ContentError> {
+            Ok(Some(format!(
+                "https://cdn.test/{object_key}?dl={}",
+                download_filename.unwrap_or("-")
+            )))
+        }
+        async fn preview_url(&self, object_key: &str) -> Result<Option<String>, ContentError> {
+            Ok(Some(format!("https://cdn.test/{object_key}?inline")))
+        }
+    }
+
+    /// URL 后端支持 presign 时:Some 原样回传;download filename **优先可编辑的 content_metadata**
+    /// (用户改名后签新名),preview 无 filename 参与。
+    #[tokio::test]
+    async fn presign_urls_pass_through_and_prefer_metadata_filename() {
+        let svc = ContentService::new(
+            Arc::new(InMemoryContentRepo::new()),
+            Arc::new(InMemoryObjectRepo::new()),
+            Arc::new(FixedUrlStore(InMemoryObjectStore::new())),
+            "cdn",
+        );
+        let out = svc.upload_content(upload_input(b"x"), None).await.unwrap();
+        // 上传时的原始名先生效(metadata 由 upload 同步,file_name = doc.txt)
+        let url = svc.download_url(out.content.id).await.unwrap().unwrap();
+        assert!(url.contains("?dl=doc.txt"), "{url}");
+        // 用户经 set_content_metadata 改名 → 下载签新名(metadata 是可编辑源,优先于 object 行)
+        svc.set_content_metadata(SetContentMetadataInput {
+            content_id: out.content.id,
+            tags: vec![],
+            file_size: None,
+            file_name: Some("renamed.txt".to_owned()),
+            mime_type: None,
+            checksum: None,
+            checksum_algorithm: None,
+            metadata: serde_json::Value::Null,
+        })
+        .await
+        .unwrap();
+        let url = svc.download_url(out.content.id).await.unwrap().unwrap();
+        assert!(url.contains("?dl=renamed.txt"), "{url}");
+        // preview:inline,无 filename
+        let url = svc.preview_url(out.content.id).await.unwrap().unwrap();
+        assert!(url.ends_with("?inline"), "{url}");
+    }
+
+    /// metadata 未同步(直接驱动仓储造"已上传但无元数据")→ preview 容忍为 None,不报错。
+    #[tokio::test]
+    async fn preview_without_metadata_degrades_to_none() {
+        let contents = Arc::new(InMemoryContentRepo::new());
+        let objects = Arc::new(InMemoryObjectRepo::new());
+        let store = Arc::new(InMemoryObjectStore::new());
+        let svc = ContentService::new(contents.clone(), objects.clone(), store.clone(), "memory");
+        // 手工铺状态:content 行 + object 行 + 字节,全程不写 content_metadata。
+        let c = contents
+            .create(
+                NewContent {
+                    tenant_id: Uuid::now_v7(),
+                    owner_id: Uuid::now_v7(),
+                    owner_type: None,
+                    name: None,
+                    description: None,
+                    document_type: None,
+                    derivation_type: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let o = objects
+            .create(
+                NewObject {
+                    content_id: c.id,
+                    storage_backend_name: "memory".to_owned(),
+                    storage_class: None,
+                    object_key: "k1".to_owned(),
+                    file_name: None,
+                    object_type: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .upload(
+                UploadParams {
+                    object_key: "k1".to_owned(),
+                    mime_type: None,
+                    file_name: None,
+                },
+                Bytes::from_static(b"raw"),
+            )
+            .await
+            .unwrap();
+        objects
+            .set_status(o.id, ObjectStatus::Uploaded, None)
+            .await
+            .unwrap();
+        contents
+            .set_status(c.id, ContentStatus::Uploaded, None)
+            .await
+            .unwrap();
+
+        let p = svc.preview_content(c.id).await.unwrap();
+        assert_eq!(&p.data[..], b"raw");
+        assert!(p.metadata.is_none(), "未同步过元数据应容忍为 None");
     }
 }
