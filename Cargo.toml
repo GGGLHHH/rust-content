@@ -3,7 +3,7 @@
 # 迁移表见 migrations/。镜像 rust-idm 的骨架:trait 端口 + 内存/PG 实现 + builder 服务 + 自有领域错误。
 [package]
 name = "content"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Self-contained content / media domain & service library: ContentService + pluggable repos + an ObjectStore blob port + its own ContentError. HTTP-agnostic — the consuming app owns routes, DTOs, validation and the S3/minio backend."

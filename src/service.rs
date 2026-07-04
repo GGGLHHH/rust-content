@@ -277,17 +277,7 @@ impl ContentService {
     /// 下载内容主对象的字节(Go `DownloadContent` 流)。
     /// 内容不存在 → `NotFound`;状态不允许下载 → `NotReady`;无已上传对象 → `NotFound`。
     pub async fn download_content(&self, content_id: Uuid) -> Result<Bytes, ContentError> {
-        // 1) 取内容(校验存在)。
-        let content = self.inner.contents.get(content_id).await?;
-        // 2) 状态守卫:仅 {Uploaded, Processed, Archived} 可下载。
-        can_download_content(content.status)?;
-        // 3) 取对象,挑第一个 status==Uploaded 的。
-        let objects = self.inner.objects.list_by_content(content_id).await?;
-        let target = objects
-            .into_iter()
-            .find(|o| o.status == ObjectStatus::Uploaded)
-            .ok_or(ContentError::NotFound)?;
-        // 4) 从后端取字节。
+        let target = self.primary_object(content_id).await?;
         self.inner.store.download(&target.object_key).await
     }
 
@@ -296,13 +286,7 @@ impl ContentService {
     /// DEFER:派生编排落地后,这里优先取 variant="preview" 的派生对象(缩略图/poster),
     /// 签名不变、调用方零改动 —— 签名就是为那天设计的。
     pub async fn preview_content(&self, content_id: Uuid) -> Result<Preview, ContentError> {
-        let content = self.inner.contents.get(content_id).await?;
-        can_download_content(content.status)?;
-        let objects = self.inner.objects.list_by_content(content_id).await?;
-        let target = objects
-            .into_iter()
-            .find(|o| o.status == ObjectStatus::Uploaded)
-            .ok_or(ContentError::NotFound)?;
+        let target = self.primary_object(content_id).await?;
         let data = self.inner.store.download(&target.object_key).await?;
         // 元数据缺失(未同步)容忍为 None;其余错误上抛。
         let metadata = match self.inner.contents.get_metadata(content_id).await {
@@ -311,6 +295,33 @@ impl ContentService {
             Err(e) => return Err(e),
         };
         Ok(Preview { data, metadata })
+    }
+
+    /// 预签名预览 URL(inline)。`Ok(None)` = 后端不支持 → 调用方回退字节代理(`preview_content`)。
+    pub async fn preview_url(&self, content_id: Uuid) -> Result<Option<String>, ContentError> {
+        let target = self.primary_object(content_id).await?;
+        self.inner.store.preview_url(&target.object_key).await
+    }
+
+    /// 预签名下载 URL(attachment,filename 取 object 行 —— 最近源)。`Ok(None)` 同上回退。
+    pub async fn download_url(&self, content_id: Uuid) -> Result<Option<String>, ContentError> {
+        let target = self.primary_object(content_id).await?;
+        self.inner
+            .store
+            .download_url(&target.object_key, target.file_name.as_deref())
+            .await
+    }
+
+    /// 状态闸 + 主对象选择(download / preview / URL 三路共用,一处收口):
+    /// 内容存在 → 状态 ∈ {Uploaded, Processed, Archived} → 第一个 Uploaded 对象。
+    async fn primary_object(&self, content_id: Uuid) -> Result<Object, ContentError> {
+        let content = self.inner.contents.get(content_id).await?;
+        can_download_content(content.status)?;
+        let objects = self.inner.objects.list_by_content(content_id).await?;
+        objects
+            .into_iter()
+            .find(|o| o.status == ObjectStatus::Uploaded)
+            .ok_or(ContentError::NotFound)
     }
 
     /// 设置内容元数据(全量替换,upsert)。先验内容存在 → `NotFound`。
@@ -557,6 +568,20 @@ mod tests {
         ));
         assert!(matches!(
             svc.preview_content(Uuid::now_v7()).await,
+            Err(ContentError::NotFound)
+        ));
+    }
+
+    /// URL 方法:状态闸照常;memory 后端 → Ok(None)(回退代理的判别信号,非错误)。
+    #[tokio::test]
+    async fn presign_urls_none_on_memory_backend() {
+        let svc = svc();
+        let out = svc.upload_content(upload_input(b"x"), None).await.unwrap();
+        assert!(svc.preview_url(out.content.id).await.unwrap().is_none());
+        assert!(svc.download_url(out.content.id).await.unwrap().is_none());
+        // 闸照常:不存在 → NotFound(不是 None)
+        assert!(matches!(
+            svc.preview_url(Uuid::now_v7()).await,
             Err(ContentError::NotFound)
         ));
     }
