@@ -1,0 +1,45 @@
+# content —— 自包含的内容/媒体**领域/服务库**(零 HTTP:domain + service + repo + ObjectStore + ContentError)。
+# 被 app 当 lib 依赖(app 在自己的 features/ 建 HTTP 边界、注入 minio/S3 的 ObjectStore 实现);也能独立做 repo 一致性测试。
+# 迁移表见 migrations/。镜像 rust-idm 的骨架:trait 端口 + 内存/PG 实现 + builder 服务 + 自有领域错误。
+[package]
+name = "content"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Self-contained content / media domain & service library: ContentService + pluggable repos + an ObjectStore blob port + its own ContentError. HTTP-agnostic — the consuming app owns routes, DTOs, validation and the S3/minio backend."
+license = "MIT"
+repository = "https://github.com/GGGLHHH/rust-content"
+keywords = ["content", "blob", "storage", "media"]
+categories = ["filesystem"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+# serde_json:仅自由表单元数据(content_metadata.metadata / object_metadata.metadata 的 JSONB)用。
+# 无 HTTP / DTO 序列化 —— 领域类型不 derive Serialize/Deserialize。
+serde_json = "1"
+
+thiserror = "2"
+anyhow = "1"
+
+# 字节缓冲:upload/download 走 owned `Bytes`(非流式;流式是 DEFER 项)。
+bytes = "1"
+
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros", "time", "migrate", "json"] }
+sea-query = "1.0"
+# with-json:JSONB 列;postgres-array:TEXT[](tags)列。二者经 sea-query-sqlx 透传给 sea-query + sqlx。
+sea-query-sqlx = { version = "0.9", default-features = false, features = ["sqlx-postgres", "runtime-tokio", "tls-rustls", "with-uuid", "with-time", "with-json", "postgres-array"] }
+async-trait = "0.1"
+
+uuid = { version = "1", features = ["v4", "v7"] }
+time = { version = "0.3", features = ["serde-well-known"] }
+
+[features]
+# 同 idm/app:pg-conformance 开了才编译打真库的仓储一致性测试。
+pg-conformance = []
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
