@@ -10,7 +10,8 @@ use uuid::Uuid;
 use crate::clock::{Clock, SystemClock};
 use crate::error::ContentError;
 use crate::input::{
-    CreateContentInput, SetContentMetadataInput, UpdateContentInput, UploadContentInput,
+    CreateContentInput, PrepareUploadInput, SetContentMetadataInput, UpdateContentInput,
+    UploadContentInput,
 };
 use crate::repo::{ContentRepo, NewContent, NewObject, ObjectRepo};
 use crate::status::{can_download_content, ContentStatus, ObjectStatus};
@@ -31,6 +32,13 @@ pub struct Preview {
     pub data: Bytes,
     /// 未同步过元数据 → `None`,调用方兜底(application/octet-stream)。
     pub metadata: Option<ContentMetadata>,
+}
+
+/// 两步上传第一步的结果:账已建、格已占、凭证已签(`None` = 后端不支持 → 调用方回退一步上传)。
+pub struct PrepareOutcome {
+    pub content: Content,
+    pub object: Object,
+    pub upload_url: Option<String>,
 }
 
 /// 内容服务。`Clone` 廉价(全是 Arc),app 直接持有它(放进 `AppState`)。
@@ -274,6 +282,147 @@ impl ContentService {
         Ok(UploadOutcome { content, object })
     }
 
+    /// 两步上传①:建 content 行 + object 行(皆 Created)+ **用户声明的元数据先写** +
+    /// 签直传凭证。字节由调用方拿凭证 PUT 后端,传完调 [`Self::confirm_upload`] 销账。
+    /// 一致性告知(同一步上传):行先于字节;拿了凭证不传 → 留 Created 孤儿行(清理 DEFER)。
+    pub async fn prepare_upload(
+        &self,
+        input: PrepareUploadInput,
+        by: Option<String>,
+    ) -> Result<PrepareOutcome, ContentError> {
+        // 1) content 行(同一步上传步骤 1)。
+        let content = self
+            .inner
+            .contents
+            .create(
+                NewContent {
+                    tenant_id: input.tenant_id,
+                    owner_id: input.owner_id,
+                    owner_type: input.owner_type,
+                    name: input.name,
+                    description: input.description,
+                    document_type: input.document_type.clone(),
+                    derivation_type: Some("original".to_owned()),
+                },
+                by.clone(),
+            )
+            .await?;
+        // 2) object 行(同步骤 2)。
+        let object_key = input
+            .object_key
+            .unwrap_or_else(|| format!("{}/{}", content.id, Uuid::now_v7()));
+        let object = self
+            .inner
+            .objects
+            .create(
+                NewObject {
+                    content_id: content.id,
+                    storage_backend_name: self.inner.default_backend_name.clone(),
+                    storage_class: None,
+                    object_key: object_key.clone(),
+                    file_name: input.file_name.clone(),
+                    object_type: None,
+                },
+                by,
+            )
+            .await?;
+        // 3) 用户声明的元数据 prepare 时即写(不等销账就可查);size/etag 留给 confirm 从后端补。
+        let now = self.inner.clock.now();
+        self.inner
+            .contents
+            .set_metadata(ContentMetadata {
+                content_id: content.id,
+                tags: input.tags,
+                file_size: None,
+                file_name: input.file_name,
+                mime_type: input.mime_type.clone(),
+                checksum: None,
+                checksum_algorithm: None,
+                metadata: input
+                    .custom_metadata
+                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        // 4) 签凭证(None 透传 = 回退一步上传的信号)。
+        let upload_url = self
+            .inner
+            .store
+            .upload_url(&object_key, input.mime_type.as_deref())
+            .await?;
+        Ok(PrepareOutcome {
+            content,
+            object,
+            upload_url,
+        })
+    }
+
+    /// 两步上传③(**不可省**,与 Go 原版 Optional 的刻意差异):本库读闸严格
+    /// (Created 状态 preview/download → NotReady),不销账 = 传上去的字节永远读不出。
+    /// **幂等**:已 Uploaded 再调直接返回(客户端网络重试安全)。
+    pub async fn confirm_upload(
+        &self,
+        content_id: Uuid,
+        by: Option<String>,
+    ) -> Result<Content, ContentError> {
+        let content = self.inner.contents.get(content_id).await?;
+        // 幂等 early-return 覆盖**全部已过账状态**(同 can_download_content 的集合):
+        // 只查 Uploaded 会让迟到的 confirm 重试把 Processed/Archived 回卷成 Uploaded —— 状态机倒车。
+        if matches!(
+            content.status,
+            ContentStatus::Uploaded | ContentStatus::Processed | ContentStatus::Archived
+        ) {
+            return Ok(content);
+        }
+        // 找 prepare 占的格子。也接受 Uploaded:上次 confirm 在"object 已翻、content 未翻"
+        // 之间崩掉,重试要能续走(整个方法幂等到崩溃恢复,不只幂等到成功重放)。
+        let objects = self.inner.objects.list_by_content(content_id).await?;
+        let target = objects
+            .into_iter()
+            .find(|o| matches!(o.status, ObjectStatus::Created | ObjectStatus::Uploaded))
+            .ok_or(ContentError::NotFound)?;
+        // 核对字节真的落桶了 —— 没传就来销账 → NotReady(app 映射 409)。
+        let store_meta = self
+            .inner
+            .store
+            .object_meta(&target.object_key)
+            .await
+            .map_err(|_| {
+                ContentError::NotReady("bytes not found in backend, upload first".to_owned())
+            })?;
+        // 翻账(镜像一步上传步骤 4-8:object 致命 → 元数据非致命 → content 致命)。
+        self.inner
+            .objects
+            .set_status(target.id, ObjectStatus::Uploaded, by.clone())
+            .await?;
+        let now = self.inner.clock.now();
+        let _ = self
+            .inner
+            .objects
+            .set_metadata(ObjectMetadata {
+                object_id: target.id,
+                size_bytes: Some(store_meta.size),
+                mime_type: store_meta.content_type.clone(),
+                etag: store_meta.etag.clone(),
+                metadata: serde_json::Value::Object(serde_json::Map::new()),
+                created_at: now,
+                updated_at: now,
+            })
+            .await;
+        // content_metadata 只补 size(prepare 写的 tags/mime/file_name/自由 jsonb 保留)。
+        if let Ok(mut meta) = self.inner.contents.get_metadata(content_id).await {
+            meta.file_size = Some(store_meta.size);
+            meta.updated_at = now;
+            let _ = self.inner.contents.set_metadata(meta).await;
+        }
+        self.inner
+            .contents
+            .set_status(content_id, ContentStatus::Uploaded, by)
+            .await?;
+        self.inner.contents.get(content_id).await
+    }
+
     /// 下载内容主对象的字节(Go `DownloadContent` 流)。
     /// 内容不存在 → `NotFound`;状态不允许下载 → `NotReady`;无已上传对象 → `NotFound`。
     pub async fn download_content(&self, content_id: Uuid) -> Result<Bytes, ContentError> {
@@ -468,6 +617,22 @@ mod tests {
         }
     }
 
+    fn prepare_input() -> PrepareUploadInput {
+        PrepareUploadInput {
+            tenant_id: Uuid::now_v7(),
+            owner_id: Uuid::now_v7(),
+            owner_type: None,
+            name: Some("doc".to_owned()),
+            description: None,
+            document_type: None,
+            object_key: None,
+            file_name: Some("doc.txt".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            tags: vec!["a".to_owned()],
+            custom_metadata: None,
+        }
+    }
+
     /// ObjectStore 无默认:builder 未设就 build → panic(wiring 错误启动期即暴露)。
     #[test]
     #[should_panic(expected = "store")]
@@ -527,7 +692,7 @@ mod tests {
     #[tokio::test]
     async fn memory_store_presign_urls_are_none() {
         let store = InMemoryObjectStore::new();
-        assert!(store.upload_url("k").await.unwrap().is_none());
+        assert!(store.upload_url("k", None).await.unwrap().is_none());
         assert!(store
             .download_url("k", Some("f.txt"))
             .await
@@ -723,5 +888,216 @@ mod tests {
         let p = svc.preview_content(c.id).await.unwrap();
         assert_eq!(&p.data[..], b"raw");
         assert!(p.metadata.is_none(), "未同步过元数据应容忍为 None");
+    }
+
+    /// prepare(memory):账建了、格占了、凭证 None(回退信号);用户声明的元数据不等销账就可查。
+    #[tokio::test]
+    async fn prepare_creates_rows_and_metadata_without_url_on_memory() {
+        let svc = svc();
+        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        assert_eq!(out.content.status, ContentStatus::Created);
+        assert_eq!(out.object.status, ObjectStatus::Created);
+        assert!(out.upload_url.is_none(), "memory 后端签不出凭证");
+        let meta = svc.get_content_metadata(out.content.id).await.unwrap();
+        assert_eq!(meta.tags, vec!["a".to_string()]);
+        assert_eq!(meta.mime_type.as_deref(), Some("text/plain"));
+        assert!(meta.file_size.is_none(), "size 留给 confirm 从后端补");
+    }
+
+    /// 后端支持时:凭证 Some 且 mime 已传给 store(签进凭证的前提)。
+    #[tokio::test]
+    async fn prepare_carries_upload_url_when_backend_supports() {
+        let svc = ContentService::new(
+            Arc::new(InMemoryContentRepo::new()),
+            Arc::new(InMemoryObjectRepo::new()),
+            Arc::new(UrlStore(InMemoryObjectStore::new())),
+            "cdn",
+        );
+        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        let url = out.upload_url.expect("该后端支持 presign");
+        assert!(url.contains(&out.object.object_key), "{url}");
+        assert!(url.contains("mime=text/plain"), "mime 应传到 store: {url}");
+    }
+
+    /// 契约测试用 store:upload_url 回显 key+mime,验证 prepare 把参数透传到端口。
+    struct UrlStore(InMemoryObjectStore);
+
+    #[async_trait::async_trait]
+    impl crate::store::ObjectStore for UrlStore {
+        async fn upload(&self, p: UploadParams, d: Bytes) -> Result<(), ContentError> {
+            self.0.upload(p, d).await
+        }
+        async fn download(&self, k: &str) -> Result<Bytes, ContentError> {
+            self.0.download(k).await
+        }
+        async fn delete(&self, k: &str) -> Result<(), ContentError> {
+            self.0.delete(k).await
+        }
+        async fn object_meta(&self, k: &str) -> Result<crate::store::ObjectMeta, ContentError> {
+            self.0.object_meta(k).await
+        }
+        async fn upload_url(
+            &self,
+            key: &str,
+            mime: Option<&str>,
+        ) -> Result<Option<String>, ContentError> {
+            Ok(Some(format!(
+                "https://cdn.test/put/{key}?mime={}",
+                mime.unwrap_or("-")
+            )))
+        }
+    }
+
+    /// 两步全流程:prepare → 模拟客户端 PUT(直写 store)→ confirm → 可下载,size 已补。
+    #[tokio::test]
+    async fn prepare_then_confirm_round_trip() {
+        let contents = Arc::new(InMemoryContentRepo::new());
+        let objects = Arc::new(InMemoryObjectRepo::new());
+        let store = Arc::new(InMemoryObjectStore::new());
+        let svc = ContentService::new(contents, objects, store.clone(), "memory");
+        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        // 模拟第二步:客户端拿凭证 PUT(这里直写同一个 store)。
+        store
+            .upload(
+                UploadParams {
+                    object_key: out.object.object_key.clone(),
+                    mime_type: Some("text/plain".to_owned()),
+                    file_name: None,
+                },
+                Bytes::from_static(b"two-step bytes"),
+            )
+            .await
+            .unwrap();
+        let c = svc.confirm_upload(out.content.id, None).await.unwrap();
+        assert_eq!(c.status, ContentStatus::Uploaded);
+        let meta = svc.get_content_metadata(c.id).await.unwrap();
+        assert_eq!(meta.file_size, Some(14), "size 由 confirm 从后端补");
+        assert_eq!(meta.tags, vec!["a".to_string()], "prepare 写的 tags 不丢");
+        let bytes = svc.download_content(c.id).await.unwrap();
+        assert_eq!(&bytes[..], b"two-step bytes");
+    }
+
+    /// 没传字节就销账 → NotReady(app 映射 409);状态不动。
+    #[tokio::test]
+    async fn confirm_before_put_is_not_ready() {
+        let svc = svc();
+        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        assert!(matches!(
+            svc.confirm_upload(out.content.id, None).await,
+            Err(ContentError::NotReady(_))
+        ));
+        assert_eq!(
+            svc.get_content(out.content.id).await.unwrap().status,
+            ContentStatus::Created
+        );
+    }
+
+    /// confirm 幂等:重试(网络抖动)不报错、状态不变。
+    #[tokio::test]
+    async fn confirm_is_idempotent() {
+        let contents = Arc::new(InMemoryContentRepo::new());
+        let objects = Arc::new(InMemoryObjectRepo::new());
+        let store = Arc::new(InMemoryObjectStore::new());
+        let svc = ContentService::new(contents, objects, store.clone(), "memory");
+        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        store
+            .upload(
+                UploadParams {
+                    object_key: out.object.object_key.clone(),
+                    mime_type: None,
+                    file_name: None,
+                },
+                Bytes::from_static(b"x"),
+            )
+            .await
+            .unwrap();
+        svc.confirm_upload(out.content.id, None).await.unwrap();
+        let again = svc.confirm_upload(out.content.id, None).await.unwrap();
+        assert_eq!(again.status, ContentStatus::Uploaded);
+    }
+
+    /// 崩溃恢复:上次 confirm 在"object 已翻、content 未翻"之间挂掉 → 重试要能续走。
+    /// (直驱 repo 制造该状态;删掉 confirm 里 `| ObjectStatus::Uploaded` 这条匹配,本测试必红。)
+    #[tokio::test]
+    async fn confirm_resumes_after_crash_between_flips() {
+        let contents = Arc::new(InMemoryContentRepo::new());
+        let objects = Arc::new(InMemoryObjectRepo::new());
+        let store = Arc::new(InMemoryObjectStore::new());
+        let svc = ContentService::new(contents.clone(), objects.clone(), store.clone(), "memory");
+        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        store
+            .upload(
+                UploadParams {
+                    object_key: out.object.object_key.clone(),
+                    mime_type: None,
+                    file_name: None,
+                },
+                Bytes::from_static(b"x"),
+            )
+            .await
+            .unwrap();
+        // 模拟半程崩溃:object 翻完、content 停在 Created。
+        objects
+            .set_status(out.object.id, ObjectStatus::Uploaded, None)
+            .await
+            .unwrap();
+        let c = svc.confirm_upload(out.content.id, None).await.unwrap();
+        assert_eq!(c.status, ContentStatus::Uploaded, "重试应续走完账");
+    }
+
+    /// 迟到的 confirm 重试不回卷状态:Processed/Archived 原样返回(状态机不倒车)。
+    #[tokio::test]
+    async fn confirm_never_rewinds_processed_or_archived() {
+        let contents = Arc::new(InMemoryContentRepo::new());
+        let objects = Arc::new(InMemoryObjectRepo::new());
+        let store = Arc::new(InMemoryObjectStore::new());
+        let svc = ContentService::new(contents.clone(), objects.clone(), store.clone(), "memory");
+        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        store
+            .upload(
+                UploadParams {
+                    object_key: out.object.object_key.clone(),
+                    mime_type: None,
+                    file_name: None,
+                },
+                Bytes::from_static(b"x"),
+            )
+            .await
+            .unwrap();
+        svc.confirm_upload(out.content.id, None).await.unwrap();
+        svc.set_content_status(out.content.id, ContentStatus::Archived, None)
+            .await
+            .unwrap();
+        let c = svc.confirm_upload(out.content.id, None).await.unwrap();
+        assert_eq!(
+            c.status,
+            ContentStatus::Archived,
+            "confirm 重试不得回卷已推进的状态"
+        );
+    }
+
+    /// 没有可销账对象(格子从未占/已删)→ NotFound。
+    #[tokio::test]
+    async fn confirm_without_object_is_not_found() {
+        let svc = svc();
+        let c = svc
+            .create_content(
+                CreateContentInput {
+                    tenant_id: Uuid::now_v7(),
+                    owner_id: Uuid::now_v7(),
+                    owner_type: None,
+                    name: None,
+                    description: None,
+                    document_type: None,
+                    derivation_type: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            svc.confirm_upload(c.id, None).await,
+            Err(ContentError::NotFound)
+        ));
     }
 }

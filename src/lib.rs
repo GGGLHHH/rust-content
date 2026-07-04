@@ -25,13 +25,14 @@ mod types;
 pub use clock::{Clock, SystemClock};
 pub use error::ContentError;
 pub use input::{
-    CreateContentInput, SetContentMetadataInput, UpdateContentInput, UploadContentInput,
+    CreateContentInput, PrepareUploadInput, SetContentMetadataInput, UpdateContentInput,
+    UploadContentInput,
 };
 pub use repo::{
     ContentRepo, InMemoryContentRepo, InMemoryObjectRepo, NewContent, NewObject, ObjectRepo,
     PgContentRepo, PgObjectRepo,
 };
-pub use service::{ContentService, ContentServiceBuilder, Preview, UploadOutcome};
+pub use service::{ContentService, ContentServiceBuilder, PrepareOutcome, Preview, UploadOutcome};
 pub use status::{ContentStatus, ObjectStatus};
 pub use store::{InMemoryObjectStore, ObjectMeta, ObjectStore, UploadParams};
 pub use types::{Content, ContentMetadata, DerivedContent, Object, ObjectMetadata};

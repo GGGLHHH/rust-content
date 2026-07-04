@@ -47,6 +47,25 @@ pub struct UploadContentInput {
     pub data: Bytes,
 }
 
+/// 两步上传第一步(prepare)的入参 —— `UploadContentInput` 减 `data`(字节由调用方直传后端)。
+/// **不复用** UploadContentInput:`data` 没有合法占位值,别用空 Bytes 骗类型。
+#[derive(Debug, Clone)]
+pub struct PrepareUploadInput {
+    pub tenant_id: Uuid,
+    pub owner_id: Uuid,
+    pub owner_type: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub document_type: Option<String>,
+    /// 后端内的 key。`None` 则服务 mint 默认 `{content_id}/{uuid}`。
+    pub object_key: Option<String>,
+    pub file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub tags: Vec<String>,
+    /// 落 content_metadata.metadata 的自由表单 JSONB(`None` → `{}`)。
+    pub custom_metadata: Option<serde_json::Value>,
+}
+
 /// 设置内容元数据(全量替换,upsert)。
 #[derive(Debug, Clone)]
 pub struct SetContentMetadataInput {

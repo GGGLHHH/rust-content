@@ -49,9 +49,15 @@ pub trait ObjectStore: Send + Sync {
     /// 读后端侧元数据(size/etag/content-type)。
     async fn object_meta(&self, object_key: &str) -> Result<ObjectMeta, ContentError>;
 
-    /// 客户端直传用的预签名上传 URL。`Ok(None)` = 后端不支持(**能力缺省,非错误**);
-    /// presign 真失败(网络/凭据)→ `Err(Storage)`,两者可判别。直传编排(create→presign→confirm)DEFER。
-    async fn upload_url(&self, _object_key: &str) -> Result<Option<String>, ContentError> {
+    /// 客户端直传用的预签名上传 URL(PUT)。`Ok(None)` = 后端不支持(**能力缺省,非错误**)。
+    /// `mime_type` 给了应**签进凭证**(S3 签名含 Content-Type → 客户端 PUT 必须带同样的头,
+    /// 类型声明跑不掉)—— 两步上传没有"写入前校验",这是唯一能提前钉住的约束。
+    /// presign 真失败(网络/凭据)→ `Err(Storage)`,与"不支持"可判别。
+    async fn upload_url(
+        &self,
+        _object_key: &str,
+        _mime_type: Option<&str>,
+    ) -> Result<Option<String>, ContentError> {
         Ok(None)
     }
 
