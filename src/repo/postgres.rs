@@ -109,6 +109,7 @@ impl PgContentRepo {
 
 #[async_trait]
 impl ContentRepo for PgContentRepo {
+    #[tracing::instrument(name = "pg.content.create", skip_all)]
     async fn create(&self, c: NewContent, by: Option<String>) -> Result<Content, ContentError> {
         let id = Uuid::now_v7();
         let (sql, values) = Query::insert()
@@ -148,6 +149,7 @@ impl ContentRepo for PgContentRepo {
         row.into_entity()
     }
 
+    #[tracing::instrument(name = "pg.content.get", skip_all)]
     async fn get(&self, id: Uuid) -> Result<Content, ContentError> {
         let (sql, values) = Query::select()
             .columns(content_cols())
@@ -163,6 +165,7 @@ impl ContentRepo for PgContentRepo {
             .into_entity()
     }
 
+    #[tracing::instrument(name = "pg.content.get_many", skip_all)]
     async fn get_many(&self, ids: &[Uuid]) -> Result<Vec<Content>, ContentError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -180,6 +183,7 @@ impl ContentRepo for PgContentRepo {
         rows.into_iter().map(ContentDbRow::into_entity).collect()
     }
 
+    #[tracing::instrument(name = "pg.content.update", skip_all)]
     async fn update(&self, c: &Content, by: Option<String>) -> Result<Content, ContentError> {
         // PUT 全量替换可编辑字段;tenant/owner/status/derivation 不动。
         let (sql, values) = Query::update()
@@ -201,6 +205,7 @@ impl ContentRepo for PgContentRepo {
             .into_entity()
     }
 
+    #[tracing::instrument(name = "pg.content.set_status", skip_all)]
     async fn set_status(
         &self,
         id: Uuid,
@@ -224,6 +229,7 @@ impl ContentRepo for PgContentRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.content.soft_delete", skip_all)]
     async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), ContentError> {
         let (sql, values) = Query::update()
             .table(ContentTable::Table)
@@ -242,6 +248,7 @@ impl ContentRepo for PgContentRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.content.list", skip_all)]
     async fn list(&self, owner_id: Uuid, tenant_id: Uuid) -> Result<Vec<Content>, ContentError> {
         let (sql, values) = Query::select()
             .columns(content_cols())
@@ -258,6 +265,7 @@ impl ContentRepo for PgContentRepo {
         rows.into_iter().map(ContentDbRow::into_entity).collect()
     }
 
+    #[tracing::instrument(name = "pg.content.set_metadata", skip_all)]
     async fn set_metadata(&self, m: ContentMetadata) -> Result<(), ContentError> {
         // upsert:PK=content_id,ON CONFLICT DO UPDATE。created_at/updated_at 由 DB 默认 + 触发器维护。
         let (sql, values) = Query::insert()
@@ -303,6 +311,7 @@ impl ContentRepo for PgContentRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.content.get_metadata", skip_all)]
     async fn get_metadata(&self, content_id: Uuid) -> Result<ContentMetadata, ContentError> {
         let (sql, values) = Query::select()
             .columns(content_meta_cols())
@@ -316,6 +325,7 @@ impl ContentRepo for PgContentRepo {
             .ok_or(ContentError::NotFound)
     }
 
+    #[tracing::instrument(name = "pg.content.get_metadata_many", skip_all)]
     async fn get_metadata_many(
         &self,
         ids: &[Uuid],
@@ -399,6 +409,7 @@ impl PgObjectRepo {
 
 #[async_trait]
 impl ObjectRepo for PgObjectRepo {
+    #[tracing::instrument(name = "pg.object.create", skip_all)]
     async fn create(&self, o: NewObject, by: Option<String>) -> Result<Object, ContentError> {
         let id = Uuid::now_v7();
         let (sql, values) = Query::insert()
@@ -438,6 +449,7 @@ impl ObjectRepo for PgObjectRepo {
         row.into_entity()
     }
 
+    #[tracing::instrument(name = "pg.object.get", skip_all)]
     async fn get(&self, id: Uuid) -> Result<Object, ContentError> {
         let (sql, values) = Query::select()
             .columns(object_cols())
@@ -453,6 +465,7 @@ impl ObjectRepo for PgObjectRepo {
             .into_entity()
     }
 
+    #[tracing::instrument(name = "pg.object.list_by_content", skip_all)]
     async fn list_by_content(&self, content_id: Uuid) -> Result<Vec<Object>, ContentError> {
         let (sql, values) = Query::select()
             .columns(object_cols())
@@ -468,6 +481,7 @@ impl ObjectRepo for PgObjectRepo {
         rows.into_iter().map(ObjectDbRow::into_entity).collect()
     }
 
+    #[tracing::instrument(name = "pg.object.get_by_key", skip_all)]
     async fn get_by_key(&self, object_key: &str, backend: &str) -> Result<Object, ContentError> {
         let (sql, values) = Query::select()
             .columns(object_cols())
@@ -484,6 +498,7 @@ impl ObjectRepo for PgObjectRepo {
             .into_entity()
     }
 
+    #[tracing::instrument(name = "pg.object.set_status", skip_all)]
     async fn set_status(
         &self,
         id: Uuid,
@@ -507,6 +522,7 @@ impl ObjectRepo for PgObjectRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.object.soft_delete", skip_all)]
     async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), ContentError> {
         let (sql, values) = Query::update()
             .table(ObjectTable::Table)
@@ -525,6 +541,7 @@ impl ObjectRepo for PgObjectRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.object.set_metadata", skip_all)]
     async fn set_metadata(&self, m: ObjectMetadata) -> Result<(), ContentError> {
         let (sql, values) = Query::insert()
             .into_table(ObjectMetaTable::Table)
@@ -560,6 +577,7 @@ impl ObjectRepo for PgObjectRepo {
         Ok(())
     }
 
+    #[tracing::instrument(name = "pg.object.get_metadata", skip_all)]
     async fn get_metadata(&self, object_id: Uuid) -> Result<ObjectMetadata, ContentError> {
         let (sql, values) = Query::select()
             .columns([

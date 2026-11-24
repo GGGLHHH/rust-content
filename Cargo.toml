@@ -21,6 +21,8 @@ serde_json = "1"
 
 thiserror = "2"
 anyhow = "1"
+# PG 仓储方法的 `pg.*` span:baserust 后台「系统监控」按它统计数据库耗时。
+tracing = "0.1"
 
 # 字节缓冲:upload/download 走 owned `Bytes`(非流式;流式是 DEFER 项)。
 bytes = "1"
