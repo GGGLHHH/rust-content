@@ -4,7 +4,7 @@
 //! "内存绿不保证 PG 绿"的漂移,全靠这套契约抓。
 //!
 //! 只断言**顺序/相对/可见性**,绝不断言绝对时间戳(PG `now()` ≠ 内存 `now_utc()`)—— 同 widget/idm 的规则。
-//! 内存入口:默认 `cargo test` 就跑(零 DB)。PG 入口:`--features pg-conformance`(需连 content role 的 pg)。
+//! 内存入口:默认 `cargo test` 就跑(零 DB)。PG 入口:`just test-pg`(需 DATABASE_URL 连 content role + 跑着的 pg)。
 
 use content::{
     Content, ContentError, ContentMetadata, ContentRepo, ContentStatus, NewContent, NewObject,

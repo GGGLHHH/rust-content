@@ -49,9 +49,12 @@ let bytes = svc.download_content(out.content.id).await?;        // -> Bytes (Not
 ## Testing
 
 ```sh
-cargo test                                 # unit + in-memory repo conformance (no DB)
-cargo test --features pg-conformance       # + memory↔Postgres repo parity (needs a running pg)
+just test       # unit + in-memory repo conformance (no DB)
+just test-pg    # + memory↔Postgres repo parity (needs a running pg; DATABASE_URL → content role)
+just lint       # rustfmt check + clippy -D warnings (same as CI)
 ```
+
+Tooling, lint config and conventions mirror baserust — see `AGENTS.md`.
 
 ## License
 

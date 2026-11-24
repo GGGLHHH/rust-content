@@ -1,0 +1,17 @@
+{
+  // even-better-toml(taplo) 的 schema 校验器解析不了 schemastore cargo schema 里
+  // [lints] 的跨文件 $ref,对 [lints.rust]/[lints.clippy] 误报 —— cargo 本身完全接受。
+  "evenBetterToml.schema.enabled": false,
+
+  // ──────── Rust ────────
+  "[rust]": {
+    // 保存时 rustfmt 格式化(可靠工作)
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+    // 不配 codeActionsOnSave:rust-analyzer 不支持 source.fixAll,保存自动修 clippy 走不通。
+    // clippy 警告改用 Cmd+. 手动一键修、或命令行 `just fix` 批量修。
+  },
+
+  // 实时检查用 clippy → 编辑器内 errorlens 标黄 + Cmd+. 可一键应用其 fix
+  "rust-analyzer.check.command": "clippy"
+}
