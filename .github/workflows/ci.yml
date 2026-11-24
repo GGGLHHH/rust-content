@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 版本由仓库根的 rust-toolchain.toml 决定(和本机、Dockerfile 一致)。
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
+  # 仓储一致性:同一份契约打真 Postgres(内存那一半在上面的 Test 里已经跑过)。
+  pg-conformance:
+    name: PG conformance
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      DATABASE_URL: postgres://content:pwd@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # 和 baserust 的建库脚本同口径:role 名 = schema 名,search_path 指向它。
+      # CREATEDB + CREATE ON DATABASE:#[sqlx::test] 要建临时库和 _sqlx_test 元数据 schema。
+      - name: Create role
+        run: |
+          psql -v ON_ERROR_STOP=1 -c "create role content login createdb password 'pwd'" \
+            -c "alter role content set search_path to content" \
+            -c "grant create on database postgres to content"
+      - name: Test against Postgres
+        run: cargo test --features pg-conformance --test content_repo_conformance -- --nocapture
