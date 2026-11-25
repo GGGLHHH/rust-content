@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # 版本由仓库根的 rust-toolchain.toml 决定(和本机、Dockerfile 一致)。
+      # 版本由仓库根的 rust-toolchain.toml 决定(和本机、baserust 一致)。
       - name: Install toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -55,6 +55,7 @@ jobs:
       - name: Install toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@just
       # 和 baserust 的建库脚本同口径:role 名 = schema 名,search_path 指向它。
       # CREATEDB + CREATE ON DATABASE:#[sqlx::test] 要建临时库和 _sqlx_test 元数据 schema。
       - name: Create role
@@ -63,4 +64,4 @@ jobs:
             -c "alter role content set search_path to content" \
             -c "grant create on database postgres to content"
       - name: Test against Postgres
-        run: cargo test --features pg-conformance --test content_repo_conformance -- --nocapture
+        run: just test-pg

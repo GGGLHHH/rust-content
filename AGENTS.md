@@ -16,7 +16,7 @@
    内存 / PG 各跑一遍。只断言顺序、相对关系、可见性、错误类型,**不断言绝对时间戳**(PG `now()` ≠ 内存时钟)。
 4. **每个 PG 仓储方法加 `#[tracing::instrument(name = "pg.<表>.<方法>", skip_all)]`**:baserust 后台「系统监控」的
    数据库耗时就是按这个 span 统计的,不加就看不到。`skip_all`:参数里有用户数据,别进日志字段。
-   每秒一轮的轮询(如 outbox 的 `poll_unpublished`)不加,否则空轮询刷屏。
+   以后若有每秒一轮的轮询方法(像 rust-idm outbox 的 `poll_unpublished`)不加,否则空轮询刷屏。
 5. **事务**:一个原子单元 = 一个 trait 方法(方法内开事务);事务对象不进 trait 签名;内存实现先校验、后改状态。
 6. **迁移在 `migrations/`**:消费方拷进自己的 `migrations/content` 跑(落哪个 schema 由 role 的 search_path 决定)。
    SQL 不写 schema 前缀。改了迁移,baserust 那边要同步拷贝。
