@@ -1,0 +1,4 @@
+# 换行一律 LF:仓库里和检出到工作区都是(和 baserust-stack、rust-idm、rust-content、cadenza 同一份规则)。
+# Windows 上 core.autocrlf=true 会把文件检出成 CRLF:shell 脚本进 Linux 容器会 "bad interpreter",
+# 生成器(vite / tsr / insta)写回 LF 后 git 又一直显示「已修改」。
+* text=auto eol=lf
