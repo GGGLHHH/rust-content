@@ -8,13 +8,59 @@
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::error::ContentError;
 use crate::status::{ContentStatus, ObjectStatus};
+
+/// 默认租户的固定 UUID(和 rust-idm、baserust 里的同名常量同值)。单租户部署的全部内容都在它名下;
+/// 迁移把旧数据里的 nil 租户也回填成它。
+pub const DEFAULT_TENANT_ID: Uuid = Uuid::from_u128(1);
+
+/// 内容的作用域 —— service / repo 每个方法的第一个业务参数,决定"看得见哪些行"。
+///
+/// - `Tenant(id)`:租户内容,只看得到 `tenant_id = id` 的行。**nil 不是合法租户**:用
+///   [`ContentScope::tenant`] 构造(nil → `InvalidInput`);直接写 `Tenant(Uuid::nil())` 的,仓储入口同样拒。
+/// - `Personal`:个人内容(如头像,不属于任何租户),库里 `tenant_id` 存 **NULL**;只看得到 NULL 行。
+///
+/// 两种作用域互相不可见。个人内容的"谁能读写"由消费方在 app 层判断(本库只按 owner 过滤列表)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ContentScope {
+    Tenant(Uuid),
+    Personal,
+}
+
+impl ContentScope {
+    /// 构造租户作用域;nil UUID → `InvalidInput`。
+    pub fn tenant(id: Uuid) -> Result<Self, ContentError> {
+        let scope = ContentScope::Tenant(id);
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    /// 行上应存的 `tenant_id`:租户 → `Some(id)`,个人 → `None`(NULL)。
+    pub fn tenant_id(&self) -> Option<Uuid> {
+        match self {
+            ContentScope::Tenant(id) => Some(*id),
+            ContentScope::Personal => None,
+        }
+    }
+
+    /// 校验作用域本身合法(nil 租户 → `InvalidInput`)。仓储每个方法入口都调。
+    pub(crate) fn validate(&self) -> Result<(), ContentError> {
+        match self {
+            ContentScope::Tenant(id) if id.is_nil() => Err(ContentError::InvalidInput(
+                "tenant id must not be nil".to_owned(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
 
 /// 内容主体(表 `content`)。
 #[derive(Clone, Debug)]
 pub struct Content {
     pub id: Uuid,
-    pub tenant_id: Uuid,
+    /// 所属租户;个人内容(`ContentScope::Personal`)为 `None`。
+    pub tenant_id: Option<Uuid>,
     pub owner_id: Uuid,
     pub owner_type: Option<String>,
     pub name: Option<String>,

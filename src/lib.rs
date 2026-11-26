@@ -11,6 +11,9 @@
 //! 分层范式:`service → repo(trait + memory/postgres)→ 领域类型`,service 依赖 trait 而非实现。
 //! 迁移表见 `migrations/`(消费方 copy 进自己的 migrations/content 跑,落哪个 schema 由 search_path 决定)。
 //!
+//! **作用域(多租户)**:service / repo 每个方法第一个业务参数是 `ContentScope`(`Tenant(id)` | `Personal`),
+//! 按 ID 取单条时别的作用域一律 `NotFound`;PG 实现每个方法一个事务、先 `set_config` 再查,表上另有 RLS 兜底。
+//!
 //! 派生内容(`content_derived`)是 **DEFER**:仅 ship `0002` 迁移 + 不透明 `DerivedContent` stub,无 service 逻辑。
 
 mod clock;
@@ -35,4 +38,7 @@ pub use repo::{
 pub use service::{ContentService, ContentServiceBuilder, PrepareOutcome, Preview, UploadOutcome};
 pub use status::{ContentStatus, ObjectStatus};
 pub use store::{InMemoryObjectStore, ObjectMeta, ObjectStore, UploadParams};
-pub use types::{Content, ContentMetadata, DerivedContent, Object, ObjectMetadata};
+pub use types::{
+    Content, ContentMetadata, ContentScope, DerivedContent, Object, ObjectMetadata,
+    DEFAULT_TENANT_ID,
+};

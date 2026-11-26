@@ -3,6 +3,10 @@
 //! UserRepo/SessionRepo/RoleRepo。范式同 widget:trait 端口 + 内存/PG 实现分文件,service 依赖 trait。
 //!
 //! 写操作收 `by: Option<String>`(审计主体,app 传);读自动过滤软删;一律返 `ContentError`。
+//!
+//! **作用域**:每个方法第一个参数是 `scope: ContentScope`,只读写本作用域的行(`Tenant(id)` ↔ `tenant_id = id`,
+//! `Personal` ↔ `tenant_id IS NULL`);别的作用域的行按"不存在"处理(取单条 / 写 / 删 → `NotFound`,批量 / 列表里缺席)。
+//! nil 租户 → `InvalidInput`。内存实现没有 RLS,这个参数是它唯一的防线;PG 实现另有 RLS 兜底(见 postgres.rs)。
 //! `NewContent`/`NewObject` 是仓储输入(无 id/时间戳;仓储 mint `Uuid::now_v7()` + DB now())。
 //!
 //! **SCAFFOLD-CORE 无跨 repo 事务**(transactions skill:原子单元=一个 trait 方法)。`upload_content`
@@ -20,15 +24,14 @@ use uuid::Uuid;
 
 use crate::error::ContentError;
 use crate::status::{ContentStatus, ObjectStatus};
-use crate::types::{Content, ContentMetadata, Object, ObjectMetadata};
+use crate::types::{Content, ContentMetadata, ContentScope, Object, ObjectMetadata};
 
 pub use memory::{InMemoryContentRepo, InMemoryObjectRepo};
 pub use postgres::{PgContentRepo, PgObjectRepo};
 
-/// 建内容的仓储输入(无 id/时间戳/状态:仓储 mint id、置 status=Created)。
+/// 建内容的仓储输入(无 id/时间戳/状态:仓储 mint id、置 status=Created;租户取自 `scope`)。
 #[derive(Debug, Clone)]
 pub struct NewContent {
-    pub tenant_id: Uuid,
     pub owner_id: Uuid,
     pub owner_type: Option<String>,
     pub name: Option<String>,
@@ -37,7 +40,7 @@ pub struct NewContent {
     pub derivation_type: Option<String>,
 }
 
-/// 建对象的仓储输入(无 id/时间戳:仓储 mint id、置 version=1、status=Created)。
+/// 建对象的仓储输入(无 id/时间戳:仓储 mint id、置 version=1、status=Created;租户取自 `scope`)。
 #[derive(Debug, Clone)]
 pub struct NewObject {
     pub content_id: Uuid,
@@ -76,6 +79,7 @@ pub(crate) enum ContentTable {
 pub(crate) enum ContentMetaTable {
     Table,
     ContentId,
+    TenantId,
     Tags,
     FileSize,
     FileName,
@@ -91,6 +95,7 @@ pub(crate) enum ContentMetaTable {
 pub(crate) enum ObjectTable {
     Table,
     Id,
+    TenantId,
     ContentId,
     StorageBackendName,
     StorageClass,
@@ -110,6 +115,7 @@ pub(crate) enum ObjectTable {
 pub(crate) enum ObjectMetaTable {
     Table,
     ObjectId,
+    TenantId,
     SizeBytes,
     MimeType,
     Etag,
@@ -121,41 +127,72 @@ pub(crate) enum ObjectMetaTable {
 /// 内容仓储端口(content + content_metadata)。
 #[async_trait]
 pub trait ContentRepo: Send + Sync {
-    /// 建内容行(status=Created)。
-    async fn create(&self, c: NewContent, by: Option<String>) -> Result<Content, ContentError>;
+    /// 建内容行(status=Created,tenant_id 取自 `scope`)。
+    async fn create(
+        &self,
+        scope: ContentScope,
+        c: NewContent,
+        by: Option<String>,
+    ) -> Result<Content, ContentError>;
 
-    /// 按 id 查存活内容。不存在 / 已软删 → `NotFound`。
-    async fn get(&self, id: Uuid) -> Result<Content, ContentError>;
+    /// 按 id 查本作用域的存活内容。不存在 / 已软删 / 别的作用域 → `NotFound`。
+    async fn get(&self, scope: ContentScope, id: Uuid) -> Result<Content, ContentError>;
 
-    /// 按 id **批量**查存活内容(N+1 防护 / 跨模块富化的根原语)。查不到的 id 不在结果里。
-    async fn get_many(&self, ids: &[Uuid]) -> Result<Vec<Content>, ContentError>;
+    /// 按 id **批量**查本作用域的存活内容(N+1 防护 / 跨模块富化的根原语)。查不到的 id 不在结果里。
+    async fn get_many(
+        &self,
+        scope: ContentScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<Content>, ContentError>;
 
-    /// **全量更新**可编辑字段(PUT 语义)。已软删 → `NotFound`。
-    async fn update(&self, c: &Content, by: Option<String>) -> Result<Content, ContentError>;
+    /// **全量更新**可编辑字段(PUT 语义)。已软删 / 别的作用域 → `NotFound`。
+    async fn update(
+        &self,
+        scope: ContentScope,
+        c: &Content,
+        by: Option<String>,
+    ) -> Result<Content, ContentError>;
 
-    /// 置内容状态。已软删/不存在 → `NotFound`。
+    /// 置内容状态。已软删 / 不存在 / 别的作用域 → `NotFound`。
     async fn set_status(
         &self,
+        scope: ContentScope,
         id: Uuid,
         status: ContentStatus,
         by: Option<String>,
     ) -> Result<(), ContentError>;
 
-    /// 软删内容。已删/不存在 → `NotFound`。
-    async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), ContentError>;
+    /// 软删内容。已删 / 不存在 / 别的作用域 → `NotFound`。
+    async fn soft_delete(
+        &self,
+        scope: ContentScope,
+        id: Uuid,
+        by: Option<String>,
+    ) -> Result<(), ContentError>;
 
-    /// 列某 (owner_id, tenant_id) 的存活内容(按 id desc)。
-    async fn list(&self, owner_id: Uuid, tenant_id: Uuid) -> Result<Vec<Content>, ContentError>;
+    /// 列本作用域里某 owner 的存活内容(按 id desc)。
+    async fn list(&self, scope: ContentScope, owner_id: Uuid)
+        -> Result<Vec<Content>, ContentError>;
 
     /// upsert content_metadata(PK=content_id,ON CONFLICT DO UPDATE)。传入时间戳由仓储覆盖。
-    async fn set_metadata(&self, m: ContentMetadata) -> Result<(), ContentError>;
+    /// 内容在本作用域不存在 / 已软删 → `NotFound`。
+    async fn set_metadata(
+        &self,
+        scope: ContentScope,
+        m: ContentMetadata,
+    ) -> Result<(), ContentError>;
 
-    /// 查 content_metadata。不存在 → `NotFound`。
-    async fn get_metadata(&self, content_id: Uuid) -> Result<ContentMetadata, ContentError>;
+    /// 查 content_metadata。不存在 / 别的作用域 → `NotFound`。
+    async fn get_metadata(
+        &self,
+        scope: ContentScope,
+        content_id: Uuid,
+    ) -> Result<ContentMetadata, ContentError>;
 
     /// 批量查 content_metadata(富化用)。查不到的 id 不在 map 里。
     async fn get_metadata_many(
         &self,
+        scope: ContentScope,
         ids: &[Uuid],
     ) -> Result<HashMap<Uuid, ContentMetadata>, ContentError>;
 }
@@ -163,32 +200,67 @@ pub trait ContentRepo: Send + Sync {
 /// 对象仓储端口(object + object_metadata)。
 #[async_trait]
 pub trait ObjectRepo: Send + Sync {
-    /// 建对象行(version=1,status=Created)。撞存活 (storage_backend_name, object_key) → `Conflict`。
-    async fn create(&self, o: NewObject, by: Option<String>) -> Result<Object, ContentError>;
+    /// 建对象行(version=1,status=Created,tenant_id 取自 `scope`)。
+    /// 撞存活 (storage_backend_name, object_key) → `Conflict`。
+    ///
+    /// **父 content 校验**:PG 实现在同一事务里先验 `o.content_id` 在本作用域存活(别的租户 / 个人作用域 /
+    /// 不存在 / 已软删 → `NotFound`)—— FK 检查不受 RLS 约束,不验就能跨作用域挂对象。
+    /// **内存实现不验**(`InMemoryObjectRepo` 与 content 仓储各管各的行,拿不到 content 表):调用方(service)
+    /// 必须先在同一作用域取到 / 建好 content 再建对象。契约用例 `object_create_requires_parent_in_scope` 只对 PG 跑。
+    async fn create(
+        &self,
+        scope: ContentScope,
+        o: NewObject,
+        by: Option<String>,
+    ) -> Result<Object, ContentError>;
 
-    /// 按 id 查存活对象。不存在 / 已软删 → `NotFound`。
-    async fn get(&self, id: Uuid) -> Result<Object, ContentError>;
+    /// 按 id 查本作用域的存活对象。不存在 / 已软删 / 别的作用域 → `NotFound`。
+    async fn get(&self, scope: ContentScope, id: Uuid) -> Result<Object, ContentError>;
 
-    /// 列某 content 的存活对象(按 id asc = 建序)。
-    async fn list_by_content(&self, content_id: Uuid) -> Result<Vec<Object>, ContentError>;
+    /// 列某 content 在本作用域的存活对象(按 id asc = 建序)。
+    async fn list_by_content(
+        &self,
+        scope: ContentScope,
+        content_id: Uuid,
+    ) -> Result<Vec<Object>, ContentError>;
 
-    /// 按 (object_key, backend) 复合唯一查存活对象。不存在 → `NotFound`。
-    async fn get_by_key(&self, object_key: &str, backend: &str) -> Result<Object, ContentError>;
+    /// 按 (object_key, backend) 复合唯一查本作用域的存活对象。不存在 → `NotFound`。
+    async fn get_by_key(
+        &self,
+        scope: ContentScope,
+        object_key: &str,
+        backend: &str,
+    ) -> Result<Object, ContentError>;
 
-    /// 置对象状态。已软删/不存在 → `NotFound`。
+    /// 置对象状态。已软删 / 不存在 / 别的作用域 → `NotFound`。
     async fn set_status(
         &self,
+        scope: ContentScope,
         id: Uuid,
         status: ObjectStatus,
         by: Option<String>,
     ) -> Result<(), ContentError>;
 
-    /// 软删对象。已删/不存在 → `NotFound`。
-    async fn soft_delete(&self, id: Uuid, by: Option<String>) -> Result<(), ContentError>;
+    /// 软删对象。已删 / 不存在 / 别的作用域 → `NotFound`。
+    async fn soft_delete(
+        &self,
+        scope: ContentScope,
+        id: Uuid,
+        by: Option<String>,
+    ) -> Result<(), ContentError>;
 
     /// upsert object_metadata(PK=object_id)。传入时间戳由仓储覆盖。
-    async fn set_metadata(&self, m: ObjectMetadata) -> Result<(), ContentError>;
+    /// 对象在本作用域不存在 / 已软删 → `NotFound`。
+    async fn set_metadata(
+        &self,
+        scope: ContentScope,
+        m: ObjectMetadata,
+    ) -> Result<(), ContentError>;
 
-    /// 查 object_metadata。不存在 → `NotFound`。
-    async fn get_metadata(&self, object_id: Uuid) -> Result<ObjectMetadata, ContentError>;
+    /// 查 object_metadata。不存在 / 别的作用域 → `NotFound`。
+    async fn get_metadata(
+        &self,
+        scope: ContentScope,
+        object_id: Uuid,
+    ) -> Result<ObjectMetadata, ContentError>;
 }

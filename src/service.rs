@@ -1,6 +1,9 @@
 //! content 业务。持 content/object 仓储端口 + ObjectStore blob 端口 + clock,编排 CRUD 与上传/下载。
 //! 范式同分层 service:依赖 trait 而非实现,在此做编排/审计下传。
 //! **入参是领域结构(`input` 模块),已由 app 在 HTTP 边界校验完**;审计主体经 `by: Option<String>` 传。
+//!
+//! **作用域**:每个公开方法第一个业务参数是 `scope: ContentScope`(租户 / 个人),原样下传仓储 ——
+//! 按 ID 取单条时别的作用域的内容一律 `NotFound`。新对象 key 也按作用域 mint(见 [`mint_object_key`])。
 
 use std::sync::Arc;
 
@@ -16,7 +19,7 @@ use crate::input::{
 use crate::repo::{ContentRepo, NewContent, NewObject, ObjectRepo};
 use crate::status::{can_download_content, ContentStatus, ObjectStatus};
 use crate::store::{ObjectStore, UploadParams};
-use crate::types::{Content, ContentMetadata, Object, ObjectMetadata};
+use crate::types::{Content, ContentMetadata, ContentScope, Object, ObjectMetadata};
 
 /// 一次性上传的结果(**纯数据**):内容 + 其主对象。app 映射成自己的对外响应 DTO。
 /// (类比 idm 的 `AuthOutcome`。)
@@ -58,6 +61,17 @@ struct Inner {
 /// 默认后端名(配合库内 `InMemoryObjectStore`)。
 const DEFAULT_BACKEND_NAME: &str = "memory";
 
+/// 服务 mint 的对象 key(调用方没给 `object_key` 时):
+/// 租户内容 `tenants/{tenant_id}/{content_id}/{uuid}`,个人内容 `personal/{owner_id}/{content_id}/{uuid}`。
+/// 前缀让存储后端按租户 / 个人分目录(便于按前缀清理、配额、审计);已有对象的 key 存在库里,不搬家。
+fn mint_object_key(scope: ContentScope, owner_id: Uuid, content_id: Uuid) -> String {
+    let leaf = Uuid::now_v7();
+    match scope {
+        ContentScope::Tenant(t) => format!("tenants/{t}/{content_id}/{leaf}"),
+        ContentScope::Personal => format!("personal/{owner_id}/{content_id}/{leaf}"),
+    }
+}
+
 impl ContentService {
     /// **便捷构造**:给齐两个仓储 + 一个 ObjectStore + 后端名(系统时钟)。
     /// 想 override 时钟 → 用 [`ContentService::builder`]。
@@ -92,14 +106,15 @@ impl ContentService {
     /// 建内容(仅 content 行,status=Created)。`by` = 审计主体。
     pub async fn create_content(
         &self,
+        scope: ContentScope,
         input: CreateContentInput,
         by: Option<String>,
     ) -> Result<Content, ContentError> {
         self.inner
             .contents
             .create(
+                scope,
                 NewContent {
-                    tenant_id: input.tenant_id,
                     owner_id: input.owner_id,
                     owner_type: input.owner_type,
                     name: input.name,
@@ -114,19 +129,24 @@ impl ContentService {
             .await
     }
 
-    /// 查内容。不存在 / 已软删 → `NotFound`。(**不**强制 tenant —— 鉴权归 app 授权层。)
-    pub async fn get_content(&self, id: Uuid) -> Result<Content, ContentError> {
-        self.inner.contents.get(id).await
+    /// 查内容。不存在 / 已软删 / 别的作用域 → `NotFound`。(owner 级鉴权仍归 app 授权层。)
+    pub async fn get_content(
+        &self,
+        scope: ContentScope,
+        id: Uuid,
+    ) -> Result<Content, ContentError> {
+        self.inner.contents.get(scope, id).await
     }
 
     /// **全量更新**内容可编辑字段(PUT)。先查存活再替换。已软删 → `NotFound`。
     pub async fn update_content(
         &self,
+        scope: ContentScope,
         id: Uuid,
         input: UpdateContentInput,
         by: Option<String>,
     ) -> Result<Content, ContentError> {
-        let existing = self.inner.contents.get(id).await?;
+        let existing = self.inner.contents.get(scope, id).await?;
         let updated = Content {
             owner_type: input.owner_type,
             name: input.name,
@@ -134,21 +154,26 @@ impl ContentService {
             document_type: input.document_type,
             ..existing
         };
-        self.inner.contents.update(&updated, by).await
+        self.inner.contents.update(scope, &updated, by).await
     }
 
     /// 软删内容。对象的清理是 DEFER(暂不级联软删 object/字节)。
-    pub async fn delete_content(&self, id: Uuid, by: Option<String>) -> Result<(), ContentError> {
-        self.inner.contents.soft_delete(id, by).await
+    pub async fn delete_content(
+        &self,
+        scope: ContentScope,
+        id: Uuid,
+        by: Option<String>,
+    ) -> Result<(), ContentError> {
+        self.inner.contents.soft_delete(scope, id, by).await
     }
 
-    /// 列某 (owner_id, tenant_id) 的存活内容(按 id desc)。
+    /// 列本作用域里某 owner 的存活内容(按 id desc)。个人作用域同样按 owner 过滤(只回自己的)。
     pub async fn list_content(
         &self,
+        scope: ContentScope,
         owner_id: Uuid,
-        tenant_id: Uuid,
     ) -> Result<Vec<Content>, ContentError> {
-        self.inner.contents.list(owner_id, tenant_id).await
+        self.inner.contents.list(scope, owner_id).await
     }
 
     /// 一次性上传(Go `UploadContent` 流):建 content + object 行 → 推字节 → 翻状态 → 同步元数据。
@@ -162,6 +187,7 @@ impl ContentService {
     /// 4/8 失败,则字节滞留。原子单元是单个 trait 方法,不在此跨两个仓储包一个 tx。
     pub async fn upload_content(
         &self,
+        scope: ContentScope,
         input: UploadContentInput,
         by: Option<String>,
     ) -> Result<UploadOutcome, ContentError> {
@@ -170,8 +196,8 @@ impl ContentService {
             .inner
             .contents
             .create(
+                scope,
                 NewContent {
-                    tenant_id: input.tenant_id,
                     owner_id: input.owner_id,
                     owner_type: input.owner_type,
                     name: input.name,
@@ -183,16 +209,17 @@ impl ContentService {
             )
             .await?;
 
-        // 步骤 2:定 object_key(None → 默认 `{content_id}/{uuid}`)+ 建 object 行(默认后端、version=1、Created)。
+        // 步骤 2:定 object_key(None → 按作用域 mint,见 mint_object_key)+ 建 object 行(默认后端、version=1、Created)。
         let backend = self.inner.default_backend_name.clone();
         let object_key = input
             .object_key
             .clone()
-            .unwrap_or_else(|| format!("{}/{}", content.id, Uuid::now_v7()));
+            .unwrap_or_else(|| mint_object_key(scope, input.owner_id, content.id));
         let object = self
             .inner
             .objects
             .create(
+                scope,
                 NewObject {
                     content_id: content.id,
                     storage_backend_name: backend,
@@ -222,7 +249,7 @@ impl ContentService {
         // 步骤 4(致命):object → Uploaded。
         self.inner
             .objects
-            .set_status(object.id, ObjectStatus::Uploaded, by.clone())
+            .set_status(scope, object.id, ObjectStatus::Uploaded, by.clone())
             .await?;
 
         // 步骤 5(非致命):读后端元数据(size/etag/content-type)。
@@ -233,52 +260,58 @@ impl ContentService {
         let _ = self
             .inner
             .objects
-            .set_metadata(ObjectMetadata {
-                object_id: object.id,
-                size_bytes: store_meta.as_ref().map(|m| m.size).or(Some(byte_len)),
-                mime_type: store_meta
-                    .as_ref()
-                    .and_then(|m| m.content_type.clone())
-                    .or_else(|| input.mime_type.clone()),
-                etag: store_meta.as_ref().and_then(|m| m.etag.clone()),
-                metadata: serde_json::Value::Object(serde_json::Map::new()),
-                created_at: now,
-                updated_at: now,
-            })
+            .set_metadata(
+                scope,
+                ObjectMetadata {
+                    object_id: object.id,
+                    size_bytes: store_meta.as_ref().map(|m| m.size).or(Some(byte_len)),
+                    mime_type: store_meta
+                        .as_ref()
+                        .and_then(|m| m.content_type.clone())
+                        .or_else(|| input.mime_type.clone()),
+                    etag: store_meta.as_ref().and_then(|m| m.etag.clone()),
+                    metadata: serde_json::Value::Object(serde_json::Map::new()),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
             .await;
 
         // 步骤 7(非致命):写 content_metadata(失败仅忽略)。
         let _ = self
             .inner
             .contents
-            .set_metadata(ContentMetadata {
-                content_id: content.id,
-                tags: input.tags,
-                file_size: store_meta.as_ref().map(|m| m.size).or(Some(byte_len)),
-                file_name: input.file_name,
-                mime_type: store_meta
-                    .as_ref()
-                    .and_then(|m| m.content_type.clone())
-                    .or(input.mime_type),
-                checksum: None,
-                checksum_algorithm: None,
-                metadata: input
-                    .custom_metadata
-                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
-                created_at: now,
-                updated_at: now,
-            })
+            .set_metadata(
+                scope,
+                ContentMetadata {
+                    content_id: content.id,
+                    tags: input.tags,
+                    file_size: store_meta.as_ref().map(|m| m.size).or(Some(byte_len)),
+                    file_name: input.file_name,
+                    mime_type: store_meta
+                        .as_ref()
+                        .and_then(|m| m.content_type.clone())
+                        .or(input.mime_type),
+                    checksum: None,
+                    checksum_algorithm: None,
+                    metadata: input
+                        .custom_metadata
+                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
             .await;
 
         // 步骤 8(致命):content → Uploaded(原始内容终态)。
         self.inner
             .contents
-            .set_status(content.id, ContentStatus::Uploaded, by)
+            .set_status(scope, content.id, ContentStatus::Uploaded, by)
             .await?;
 
         // 回读最终态实体(status 已翻 Uploaded),组装结果。
-        let content = self.inner.contents.get(content.id).await?;
-        let object = self.inner.objects.get(object.id).await?;
+        let content = self.inner.contents.get(scope, content.id).await?;
+        let object = self.inner.objects.get(scope, object.id).await?;
         Ok(UploadOutcome { content, object })
     }
 
@@ -287,6 +320,7 @@ impl ContentService {
     /// 一致性告知(同一步上传):行先于字节;拿了凭证不传 → 留 Created 孤儿行(清理 DEFER)。
     pub async fn prepare_upload(
         &self,
+        scope: ContentScope,
         input: PrepareUploadInput,
         by: Option<String>,
     ) -> Result<PrepareOutcome, ContentError> {
@@ -295,8 +329,8 @@ impl ContentService {
             .inner
             .contents
             .create(
+                scope,
                 NewContent {
-                    tenant_id: input.tenant_id,
                     owner_id: input.owner_id,
                     owner_type: input.owner_type,
                     name: input.name,
@@ -310,11 +344,12 @@ impl ContentService {
         // 2) object 行(同步骤 2)。
         let object_key = input
             .object_key
-            .unwrap_or_else(|| format!("{}/{}", content.id, Uuid::now_v7()));
+            .unwrap_or_else(|| mint_object_key(scope, input.owner_id, content.id));
         let object = self
             .inner
             .objects
             .create(
+                scope,
                 NewObject {
                     content_id: content.id,
                     storage_backend_name: self.inner.default_backend_name.clone(),
@@ -330,20 +365,23 @@ impl ContentService {
         let now = self.inner.clock.now();
         self.inner
             .contents
-            .set_metadata(ContentMetadata {
-                content_id: content.id,
-                tags: input.tags,
-                file_size: None,
-                file_name: input.file_name,
-                mime_type: input.mime_type.clone(),
-                checksum: None,
-                checksum_algorithm: None,
-                metadata: input
-                    .custom_metadata
-                    .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
-                created_at: now,
-                updated_at: now,
-            })
+            .set_metadata(
+                scope,
+                ContentMetadata {
+                    content_id: content.id,
+                    tags: input.tags,
+                    file_size: None,
+                    file_name: input.file_name,
+                    mime_type: input.mime_type.clone(),
+                    checksum: None,
+                    checksum_algorithm: None,
+                    metadata: input
+                        .custom_metadata
+                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new())),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
             .await?;
         // 4) 签凭证(None 透传 = 回退一步上传的信号)。
         let upload_url = self
@@ -363,10 +401,11 @@ impl ContentService {
     /// **幂等**:已 Uploaded 再调直接返回(客户端网络重试安全)。
     pub async fn confirm_upload(
         &self,
+        scope: ContentScope,
         content_id: Uuid,
         by: Option<String>,
     ) -> Result<Content, ContentError> {
-        let content = self.inner.contents.get(content_id).await?;
+        let content = self.inner.contents.get(scope, content_id).await?;
         // 幂等 early-return 覆盖**全部已过账状态**(同 can_download_content 的集合):
         // 只查 Uploaded 会让迟到的 confirm 重试把 Processed/Archived 回卷成 Uploaded —— 状态机倒车。
         if matches!(
@@ -377,7 +416,11 @@ impl ContentService {
         }
         // 找 prepare 占的格子。也接受 Uploaded:上次 confirm 在"object 已翻、content 未翻"
         // 之间崩掉,重试要能续走(整个方法幂等到崩溃恢复,不只幂等到成功重放)。
-        let objects = self.inner.objects.list_by_content(content_id).await?;
+        let objects = self
+            .inner
+            .objects
+            .list_by_content(scope, content_id)
+            .await?;
         let target = objects
             .into_iter()
             .find(|o| matches!(o.status, ObjectStatus::Created | ObjectStatus::Uploaded))
@@ -394,39 +437,46 @@ impl ContentService {
         // 翻账(镜像一步上传步骤 4-8:object 致命 → 元数据非致命 → content 致命)。
         self.inner
             .objects
-            .set_status(target.id, ObjectStatus::Uploaded, by.clone())
+            .set_status(scope, target.id, ObjectStatus::Uploaded, by.clone())
             .await?;
         let now = self.inner.clock.now();
         let _ = self
             .inner
             .objects
-            .set_metadata(ObjectMetadata {
-                object_id: target.id,
-                size_bytes: Some(store_meta.size),
-                mime_type: store_meta.content_type.clone(),
-                etag: store_meta.etag.clone(),
-                metadata: serde_json::Value::Object(serde_json::Map::new()),
-                created_at: now,
-                updated_at: now,
-            })
+            .set_metadata(
+                scope,
+                ObjectMetadata {
+                    object_id: target.id,
+                    size_bytes: Some(store_meta.size),
+                    mime_type: store_meta.content_type.clone(),
+                    etag: store_meta.etag.clone(),
+                    metadata: serde_json::Value::Object(serde_json::Map::new()),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
             .await;
         // content_metadata 只补 size(prepare 写的 tags/mime/file_name/自由 jsonb 保留)。
-        if let Ok(mut meta) = self.inner.contents.get_metadata(content_id).await {
+        if let Ok(mut meta) = self.inner.contents.get_metadata(scope, content_id).await {
             meta.file_size = Some(store_meta.size);
             meta.updated_at = now;
-            let _ = self.inner.contents.set_metadata(meta).await;
+            let _ = self.inner.contents.set_metadata(scope, meta).await;
         }
         self.inner
             .contents
-            .set_status(content_id, ContentStatus::Uploaded, by)
+            .set_status(scope, content_id, ContentStatus::Uploaded, by)
             .await?;
-        self.inner.contents.get(content_id).await
+        self.inner.contents.get(scope, content_id).await
     }
 
     /// 下载内容主对象的字节(Go `DownloadContent` 流)。
     /// 内容不存在 → `NotFound`;状态不允许下载 → `NotReady`;无已上传对象 → `NotFound`。
-    pub async fn download_content(&self, content_id: Uuid) -> Result<Bytes, ContentError> {
-        let target = self.primary_object(content_id).await?;
+    pub async fn download_content(
+        &self,
+        scope: ContentScope,
+        content_id: Uuid,
+    ) -> Result<Bytes, ContentError> {
+        let target = self.primary_object(scope, content_id).await?;
         self.inner.store.download(&target.object_key).await
     }
 
@@ -434,11 +484,15 @@ impl ContentService {
     /// ("可展示"=="可下载",同一生命周期约束)。
     /// DEFER:派生编排落地后,这里优先取 variant="preview" 的派生对象(缩略图/poster),
     /// 签名不变、调用方零改动 —— 签名就是为那天设计的。
-    pub async fn preview_content(&self, content_id: Uuid) -> Result<Preview, ContentError> {
-        let target = self.primary_object(content_id).await?;
+    pub async fn preview_content(
+        &self,
+        scope: ContentScope,
+        content_id: Uuid,
+    ) -> Result<Preview, ContentError> {
+        let target = self.primary_object(scope, content_id).await?;
         let data = self.inner.store.download(&target.object_key).await?;
         // 元数据缺失(未同步)容忍为 None;其余错误上抛。
-        let metadata = match self.inner.contents.get_metadata(content_id).await {
+        let metadata = match self.inner.contents.get_metadata(scope, content_id).await {
             Ok(m) => Some(m),
             Err(ContentError::NotFound) => None,
             Err(e) => return Err(e),
@@ -447,17 +501,25 @@ impl ContentService {
     }
 
     /// 预签名预览 URL(inline)。`Ok(None)` = 后端不支持 → 调用方回退字节代理(`preview_content`)。
-    pub async fn preview_url(&self, content_id: Uuid) -> Result<Option<String>, ContentError> {
-        let target = self.primary_object(content_id).await?;
+    pub async fn preview_url(
+        &self,
+        scope: ContentScope,
+        content_id: Uuid,
+    ) -> Result<Option<String>, ContentError> {
+        let target = self.primary_object(scope, content_id).await?;
         self.inner.store.preview_url(&target.object_key).await
     }
 
     /// 预签名下载 URL(attachment)。`Ok(None)` 同上回退。
     /// filename **优先 content_metadata**(经 set_content_metadata 可编辑 —— 用户改名后签新名),
     /// 回退 object 行(建行时的原始名,之后不可变)。
-    pub async fn download_url(&self, content_id: Uuid) -> Result<Option<String>, ContentError> {
-        let target = self.primary_object(content_id).await?;
-        let meta_name = match self.inner.contents.get_metadata(content_id).await {
+    pub async fn download_url(
+        &self,
+        scope: ContentScope,
+        content_id: Uuid,
+    ) -> Result<Option<String>, ContentError> {
+        let target = self.primary_object(scope, content_id).await?;
+        let meta_name = match self.inner.contents.get_metadata(scope, content_id).await {
             Ok(m) => m.file_name,
             Err(ContentError::NotFound) => None,
             Err(e) => return Err(e),
@@ -471,10 +533,18 @@ impl ContentService {
 
     /// 状态闸 + 主对象选择(download / preview / URL 三路共用,一处收口):
     /// 内容存在 → 状态 ∈ {Uploaded, Processed, Archived} → 第一个 Uploaded 对象。
-    async fn primary_object(&self, content_id: Uuid) -> Result<Object, ContentError> {
-        let content = self.inner.contents.get(content_id).await?;
+    async fn primary_object(
+        &self,
+        scope: ContentScope,
+        content_id: Uuid,
+    ) -> Result<Object, ContentError> {
+        let content = self.inner.contents.get(scope, content_id).await?;
         can_download_content(content.status)?;
-        let objects = self.inner.objects.list_by_content(content_id).await?;
+        let objects = self
+            .inner
+            .objects
+            .list_by_content(scope, content_id)
+            .await?;
         objects
             .into_iter()
             .find(|o| o.status == ObjectStatus::Uploaded)
@@ -484,58 +554,69 @@ impl ContentService {
     /// 设置内容元数据(全量替换,upsert)。先验内容存在 → `NotFound`。
     pub async fn set_content_metadata(
         &self,
+        scope: ContentScope,
         input: SetContentMetadataInput,
     ) -> Result<(), ContentError> {
-        self.inner.contents.get(input.content_id).await?; // 验存在
+        self.inner.contents.get(scope, input.content_id).await?; // 验存在
         let now = self.inner.clock.now();
         self.inner
             .contents
-            .set_metadata(ContentMetadata {
-                content_id: input.content_id,
-                tags: input.tags,
-                file_size: input.file_size,
-                file_name: input.file_name,
-                mime_type: input.mime_type,
-                checksum: input.checksum,
-                checksum_algorithm: input.checksum_algorithm,
-                metadata: input.metadata,
-                created_at: now,
-                updated_at: now,
-            })
+            .set_metadata(
+                scope,
+                ContentMetadata {
+                    content_id: input.content_id,
+                    tags: input.tags,
+                    file_size: input.file_size,
+                    file_name: input.file_name,
+                    mime_type: input.mime_type,
+                    checksum: input.checksum,
+                    checksum_algorithm: input.checksum_algorithm,
+                    metadata: input.metadata,
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
             .await
     }
 
     /// 查内容元数据。不存在 → `NotFound`。
     pub async fn get_content_metadata(
         &self,
+        scope: ContentScope,
         content_id: Uuid,
     ) -> Result<ContentMetadata, ContentError> {
-        self.inner.contents.get_metadata(content_id).await
+        self.inner.contents.get_metadata(scope, content_id).await
     }
 
     /// 列某内容的对象(读侧 HTTP 层会用)。
-    pub async fn get_objects(&self, content_id: Uuid) -> Result<Vec<Object>, ContentError> {
-        self.inner.objects.list_by_content(content_id).await
+    pub async fn get_objects(
+        &self,
+        scope: ContentScope,
+        content_id: Uuid,
+    ) -> Result<Vec<Object>, ContentError> {
+        self.inner.objects.list_by_content(scope, content_id).await
     }
 
     /// 显式置内容状态(异步工作流钩子)。状态已 typed(类型即合法),故为对仓储 set_status 的薄包装。
     pub async fn set_content_status(
         &self,
+        scope: ContentScope,
         id: Uuid,
         status: ContentStatus,
         by: Option<String>,
     ) -> Result<(), ContentError> {
-        self.inner.contents.set_status(id, status, by).await
+        self.inner.contents.set_status(scope, id, status, by).await
     }
 
     /// 显式置对象状态(异步工作流钩子)。同上,薄包装。
     pub async fn set_object_status(
         &self,
+        scope: ContentScope,
         id: Uuid,
         status: ObjectStatus,
         by: Option<String>,
     ) -> Result<(), ContentError> {
-        self.inner.objects.set_status(id, status, by).await
+        self.inner.objects.set_status(scope, id, status, by).await
     }
 }
 
@@ -590,6 +671,10 @@ mod tests {
     use super::*;
     use crate::repo::{InMemoryContentRepo, InMemoryObjectRepo};
     use crate::store::InMemoryObjectStore;
+    use crate::types::DEFAULT_TENANT_ID;
+
+    /// 单测默认作用域:默认租户。
+    const S: ContentScope = ContentScope::Tenant(DEFAULT_TENANT_ID);
 
     fn svc() -> ContentService {
         ContentService::new(
@@ -602,7 +687,6 @@ mod tests {
 
     fn upload_input(data: &'static [u8]) -> UploadContentInput {
         UploadContentInput {
-            tenant_id: Uuid::now_v7(),
             owner_id: Uuid::now_v7(),
             owner_type: None,
             name: Some("doc".to_owned()),
@@ -619,7 +703,6 @@ mod tests {
 
     fn prepare_input() -> PrepareUploadInput {
         PrepareUploadInput {
-            tenant_id: Uuid::now_v7(),
             owner_id: Uuid::now_v7(),
             owner_type: None,
             name: Some("doc".to_owned()),
@@ -649,17 +732,17 @@ mod tests {
     async fn upload_then_download_round_trip() {
         let svc = svc();
         let out = svc
-            .upload_content(upload_input(b"hello content"), Some("sys".into()))
+            .upload_content(S, upload_input(b"hello content"), Some("sys".into()))
             .await
             .unwrap();
         assert_eq!(out.content.status, ContentStatus::Uploaded);
         assert_eq!(out.object.status, ObjectStatus::Uploaded);
 
-        let bytes = svc.download_content(out.content.id).await.unwrap();
+        let bytes = svc.download_content(S, out.content.id).await.unwrap();
         assert_eq!(&bytes[..], b"hello content");
 
         // content_metadata 已由步骤 7 同步(size 来自后端、tags 透传)。
-        let meta = svc.get_content_metadata(out.content.id).await.unwrap();
+        let meta = svc.get_content_metadata(S, out.content.id).await.unwrap();
         assert_eq!(meta.file_size, Some(13));
         assert_eq!(meta.tags, vec!["a".to_string()]);
     }
@@ -670,8 +753,8 @@ mod tests {
         let svc = svc();
         let c = svc
             .create_content(
+                S,
                 CreateContentInput {
-                    tenant_id: Uuid::now_v7(),
                     owner_id: Uuid::now_v7(),
                     owner_type: None,
                     name: None,
@@ -684,7 +767,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            svc.download_content(c.id).await,
+            svc.download_content(S, c.id).await,
             Err(ContentError::NotReady(_))
         ));
     }
@@ -706,10 +789,10 @@ mod tests {
     async fn preview_returns_bytes_with_metadata() {
         let svc = svc();
         let out = svc
-            .upload_content(upload_input(b"img-bytes"), Some("sys".into()))
+            .upload_content(S, upload_input(b"img-bytes"), Some("sys".into()))
             .await
             .unwrap();
-        let p = svc.preview_content(out.content.id).await.unwrap();
+        let p = svc.preview_content(S, out.content.id).await.unwrap();
         assert_eq!(&p.data[..], b"img-bytes");
         let meta = p.metadata.expect("upload 已同步元数据");
         assert_eq!(meta.mime_type.as_deref(), Some("text/plain"));
@@ -722,8 +805,8 @@ mod tests {
         let svc = svc();
         let c = svc
             .create_content(
+                S,
                 CreateContentInput {
-                    tenant_id: Uuid::now_v7(),
                     owner_id: Uuid::now_v7(),
                     owner_type: None,
                     name: None,
@@ -736,11 +819,11 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            svc.preview_content(c.id).await,
+            svc.preview_content(S, c.id).await,
             Err(ContentError::NotReady(_))
         ));
         assert!(matches!(
-            svc.preview_content(Uuid::now_v7()).await,
+            svc.preview_content(S, Uuid::now_v7()).await,
             Err(ContentError::NotFound)
         ));
     }
@@ -749,12 +832,15 @@ mod tests {
     #[tokio::test]
     async fn presign_urls_none_on_memory_backend() {
         let svc = svc();
-        let out = svc.upload_content(upload_input(b"x"), None).await.unwrap();
-        assert!(svc.preview_url(out.content.id).await.unwrap().is_none());
-        assert!(svc.download_url(out.content.id).await.unwrap().is_none());
+        let out = svc
+            .upload_content(S, upload_input(b"x"), None)
+            .await
+            .unwrap();
+        assert!(svc.preview_url(S, out.content.id).await.unwrap().is_none());
+        assert!(svc.download_url(S, out.content.id).await.unwrap().is_none());
         // 闸照常:不存在 → NotFound(不是 None)
         assert!(matches!(
-            svc.preview_url(Uuid::now_v7()).await,
+            svc.preview_url(S, Uuid::now_v7()).await,
             Err(ContentError::NotFound)
         ));
     }
@@ -804,27 +890,33 @@ mod tests {
             Arc::new(FixedUrlStore(InMemoryObjectStore::new())),
             "cdn",
         );
-        let out = svc.upload_content(upload_input(b"x"), None).await.unwrap();
+        let out = svc
+            .upload_content(S, upload_input(b"x"), None)
+            .await
+            .unwrap();
         // 上传时的原始名先生效(metadata 由 upload 同步,file_name = doc.txt)
-        let url = svc.download_url(out.content.id).await.unwrap().unwrap();
+        let url = svc.download_url(S, out.content.id).await.unwrap().unwrap();
         assert!(url.contains("?dl=doc.txt"), "{url}");
         // 用户经 set_content_metadata 改名 → 下载签新名(metadata 是可编辑源,优先于 object 行)
-        svc.set_content_metadata(SetContentMetadataInput {
-            content_id: out.content.id,
-            tags: vec![],
-            file_size: None,
-            file_name: Some("renamed.txt".to_owned()),
-            mime_type: None,
-            checksum: None,
-            checksum_algorithm: None,
-            metadata: serde_json::Value::Null,
-        })
+        svc.set_content_metadata(
+            S,
+            SetContentMetadataInput {
+                content_id: out.content.id,
+                tags: vec![],
+                file_size: None,
+                file_name: Some("renamed.txt".to_owned()),
+                mime_type: None,
+                checksum: None,
+                checksum_algorithm: None,
+                metadata: serde_json::Value::Null,
+            },
+        )
         .await
         .unwrap();
-        let url = svc.download_url(out.content.id).await.unwrap().unwrap();
+        let url = svc.download_url(S, out.content.id).await.unwrap().unwrap();
         assert!(url.contains("?dl=renamed.txt"), "{url}");
         // preview:inline,无 filename
-        let url = svc.preview_url(out.content.id).await.unwrap().unwrap();
+        let url = svc.preview_url(S, out.content.id).await.unwrap().unwrap();
         assert!(url.ends_with("?inline"), "{url}");
     }
 
@@ -838,8 +930,8 @@ mod tests {
         // 手工铺状态:content 行 + object 行 + 字节,全程不写 content_metadata。
         let c = contents
             .create(
+                S,
                 NewContent {
-                    tenant_id: Uuid::now_v7(),
                     owner_id: Uuid::now_v7(),
                     owner_type: None,
                     name: None,
@@ -853,6 +945,7 @@ mod tests {
             .unwrap();
         let o = objects
             .create(
+                S,
                 NewObject {
                     content_id: c.id,
                     storage_backend_name: "memory".to_owned(),
@@ -877,15 +970,15 @@ mod tests {
             .await
             .unwrap();
         objects
-            .set_status(o.id, ObjectStatus::Uploaded, None)
+            .set_status(S, o.id, ObjectStatus::Uploaded, None)
             .await
             .unwrap();
         contents
-            .set_status(c.id, ContentStatus::Uploaded, None)
+            .set_status(S, c.id, ContentStatus::Uploaded, None)
             .await
             .unwrap();
 
-        let p = svc.preview_content(c.id).await.unwrap();
+        let p = svc.preview_content(S, c.id).await.unwrap();
         assert_eq!(&p.data[..], b"raw");
         assert!(p.metadata.is_none(), "未同步过元数据应容忍为 None");
     }
@@ -894,11 +987,11 @@ mod tests {
     #[tokio::test]
     async fn prepare_creates_rows_and_metadata_without_url_on_memory() {
         let svc = svc();
-        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        let out = svc.prepare_upload(S, prepare_input(), None).await.unwrap();
         assert_eq!(out.content.status, ContentStatus::Created);
         assert_eq!(out.object.status, ObjectStatus::Created);
         assert!(out.upload_url.is_none(), "memory 后端签不出凭证");
-        let meta = svc.get_content_metadata(out.content.id).await.unwrap();
+        let meta = svc.get_content_metadata(S, out.content.id).await.unwrap();
         assert_eq!(meta.tags, vec!["a".to_string()]);
         assert_eq!(meta.mime_type.as_deref(), Some("text/plain"));
         assert!(meta.file_size.is_none(), "size 留给 confirm 从后端补");
@@ -913,7 +1006,7 @@ mod tests {
             Arc::new(UrlStore(InMemoryObjectStore::new())),
             "cdn",
         );
-        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        let out = svc.prepare_upload(S, prepare_input(), None).await.unwrap();
         let url = out.upload_url.expect("该后端支持 presign");
         assert!(url.contains(&out.object.object_key), "{url}");
         assert!(url.contains("mime=text/plain"), "mime 应传到 store: {url}");
@@ -955,7 +1048,7 @@ mod tests {
         let objects = Arc::new(InMemoryObjectRepo::new());
         let store = Arc::new(InMemoryObjectStore::new());
         let svc = ContentService::new(contents, objects, store.clone(), "memory");
-        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        let out = svc.prepare_upload(S, prepare_input(), None).await.unwrap();
         // 模拟第二步:客户端拿凭证 PUT(这里直写同一个 store)。
         store
             .upload(
@@ -968,12 +1061,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let c = svc.confirm_upload(out.content.id, None).await.unwrap();
+        let c = svc.confirm_upload(S, out.content.id, None).await.unwrap();
         assert_eq!(c.status, ContentStatus::Uploaded);
-        let meta = svc.get_content_metadata(c.id).await.unwrap();
+        let meta = svc.get_content_metadata(S, c.id).await.unwrap();
         assert_eq!(meta.file_size, Some(14), "size 由 confirm 从后端补");
         assert_eq!(meta.tags, vec!["a".to_string()], "prepare 写的 tags 不丢");
-        let bytes = svc.download_content(c.id).await.unwrap();
+        let bytes = svc.download_content(S, c.id).await.unwrap();
         assert_eq!(&bytes[..], b"two-step bytes");
     }
 
@@ -981,13 +1074,13 @@ mod tests {
     #[tokio::test]
     async fn confirm_before_put_is_not_ready() {
         let svc = svc();
-        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        let out = svc.prepare_upload(S, prepare_input(), None).await.unwrap();
         assert!(matches!(
-            svc.confirm_upload(out.content.id, None).await,
+            svc.confirm_upload(S, out.content.id, None).await,
             Err(ContentError::NotReady(_))
         ));
         assert_eq!(
-            svc.get_content(out.content.id).await.unwrap().status,
+            svc.get_content(S, out.content.id).await.unwrap().status,
             ContentStatus::Created
         );
     }
@@ -999,7 +1092,7 @@ mod tests {
         let objects = Arc::new(InMemoryObjectRepo::new());
         let store = Arc::new(InMemoryObjectStore::new());
         let svc = ContentService::new(contents, objects, store.clone(), "memory");
-        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        let out = svc.prepare_upload(S, prepare_input(), None).await.unwrap();
         store
             .upload(
                 UploadParams {
@@ -1011,8 +1104,8 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.confirm_upload(out.content.id, None).await.unwrap();
-        let again = svc.confirm_upload(out.content.id, None).await.unwrap();
+        svc.confirm_upload(S, out.content.id, None).await.unwrap();
+        let again = svc.confirm_upload(S, out.content.id, None).await.unwrap();
         assert_eq!(again.status, ContentStatus::Uploaded);
     }
 
@@ -1024,7 +1117,7 @@ mod tests {
         let objects = Arc::new(InMemoryObjectRepo::new());
         let store = Arc::new(InMemoryObjectStore::new());
         let svc = ContentService::new(contents.clone(), objects.clone(), store.clone(), "memory");
-        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        let out = svc.prepare_upload(S, prepare_input(), None).await.unwrap();
         store
             .upload(
                 UploadParams {
@@ -1038,10 +1131,10 @@ mod tests {
             .unwrap();
         // 模拟半程崩溃:object 翻完、content 停在 Created。
         objects
-            .set_status(out.object.id, ObjectStatus::Uploaded, None)
+            .set_status(S, out.object.id, ObjectStatus::Uploaded, None)
             .await
             .unwrap();
-        let c = svc.confirm_upload(out.content.id, None).await.unwrap();
+        let c = svc.confirm_upload(S, out.content.id, None).await.unwrap();
         assert_eq!(c.status, ContentStatus::Uploaded, "重试应续走完账");
     }
 
@@ -1052,7 +1145,7 @@ mod tests {
         let objects = Arc::new(InMemoryObjectRepo::new());
         let store = Arc::new(InMemoryObjectStore::new());
         let svc = ContentService::new(contents.clone(), objects.clone(), store.clone(), "memory");
-        let out = svc.prepare_upload(prepare_input(), None).await.unwrap();
+        let out = svc.prepare_upload(S, prepare_input(), None).await.unwrap();
         store
             .upload(
                 UploadParams {
@@ -1064,11 +1157,11 @@ mod tests {
             )
             .await
             .unwrap();
-        svc.confirm_upload(out.content.id, None).await.unwrap();
-        svc.set_content_status(out.content.id, ContentStatus::Archived, None)
+        svc.confirm_upload(S, out.content.id, None).await.unwrap();
+        svc.set_content_status(S, out.content.id, ContentStatus::Archived, None)
             .await
             .unwrap();
-        let c = svc.confirm_upload(out.content.id, None).await.unwrap();
+        let c = svc.confirm_upload(S, out.content.id, None).await.unwrap();
         assert_eq!(
             c.status,
             ContentStatus::Archived,
@@ -1082,8 +1175,8 @@ mod tests {
         let svc = svc();
         let c = svc
             .create_content(
+                S,
                 CreateContentInput {
-                    tenant_id: Uuid::now_v7(),
                     owner_id: Uuid::now_v7(),
                     owner_type: None,
                     name: None,
@@ -1096,8 +1189,115 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            svc.confirm_upload(c.id, None).await,
+            svc.confirm_upload(S, c.id, None).await,
             Err(ContentError::NotFound)
+        ));
+    }
+
+    /// 跨租户:A 上传的内容,B 作用域经 service 的每个按 ID 方法都 NotFound;A 的状态不受影响。
+    #[tokio::test]
+    async fn cross_tenant_service_calls_are_not_found() {
+        let svc = svc();
+        let a = ContentScope::tenant(Uuid::now_v7()).unwrap();
+        let b = ContentScope::tenant(Uuid::now_v7()).unwrap();
+        let out = svc
+            .upload_content(a, upload_input(b"a-bytes"), None)
+            .await
+            .unwrap();
+        let id = out.content.id;
+        let nf = |r: Result<(), ContentError>| matches!(r, Err(ContentError::NotFound));
+        assert!(nf(svc.get_content(b, id).await.map(|_| ())));
+        assert!(nf(svc.download_content(b, id).await.map(|_| ())));
+        assert!(nf(svc.preview_content(b, id).await.map(|_| ())));
+        assert!(nf(svc.preview_url(b, id).await.map(|_| ())));
+        assert!(nf(svc.download_url(b, id).await.map(|_| ())));
+        assert!(nf(svc.get_content_metadata(b, id).await.map(|_| ())));
+        assert!(nf(svc.confirm_upload(b, id, None).await.map(|_| ())));
+        assert!(nf(svc
+            .update_content(
+                b,
+                id,
+                UpdateContentInput {
+                    owner_type: None,
+                    name: Some("hijack".into()),
+                    description: None,
+                    document_type: None,
+                },
+                None,
+            )
+            .await
+            .map(|_| ())));
+        assert!(nf(svc
+            .set_content_metadata(
+                b,
+                SetContentMetadataInput {
+                    content_id: id,
+                    tags: vec![],
+                    file_size: None,
+                    file_name: None,
+                    mime_type: None,
+                    checksum: None,
+                    checksum_algorithm: None,
+                    metadata: serde_json::Value::Null,
+                },
+            )
+            .await));
+        assert!(nf(svc
+            .set_content_status(b, id, ContentStatus::Archived, None)
+            .await));
+        assert!(nf(svc
+            .set_object_status(b, out.object.id, ObjectStatus::Failed, None)
+            .await));
+        assert!(nf(svc.delete_content(b, id, None).await));
+        assert!(svc.get_objects(b, id).await.unwrap().is_empty());
+        assert!(svc
+            .list_content(b, out.content.owner_id)
+            .await
+            .unwrap()
+            .is_empty());
+        // A 原样:还在、名字没被改、可下载
+        let c = svc.get_content(a, id).await.unwrap();
+        assert_eq!(c.name.as_deref(), Some("doc"));
+        assert_eq!(c.status, ContentStatus::Uploaded);
+        assert_eq!(&svc.download_content(a, id).await.unwrap()[..], b"a-bytes");
+    }
+
+    /// 个人作用域:list 按 owner 过滤;租户作用域看不到个人内容;tenant_id = None。
+    #[tokio::test]
+    async fn personal_scope_lists_by_owner_and_hides_from_tenants() {
+        let svc = svc();
+        let p = ContentScope::Personal;
+        let mine = upload_input(b"me");
+        let me = mine.owner_id;
+        let out = svc.upload_content(p, mine, None).await.unwrap();
+        svc.upload_content(p, upload_input(b"other"), None)
+            .await
+            .unwrap();
+        assert_eq!(out.content.tenant_id, None);
+        let listed = svc.list_content(p, me).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![out.content.id]
+        );
+        assert!(matches!(
+            svc.get_content(S, out.content.id).await,
+            Err(ContentError::NotFound)
+        ));
+        assert!(svc.list_content(S, me).await.unwrap().is_empty());
+    }
+
+    /// nil 租户:构造即拒;直接写 `Tenant(nil)` 调 service → 仓储入口拒(InvalidInput)。
+    #[tokio::test]
+    async fn nil_tenant_scope_is_invalid_input() {
+        assert!(matches!(
+            ContentScope::tenant(Uuid::nil()),
+            Err(ContentError::InvalidInput(_))
+        ));
+        let svc = svc();
+        assert!(matches!(
+            svc.upload_content(ContentScope::Tenant(Uuid::nil()), upload_input(b"x"), None)
+                .await,
+            Err(ContentError::InvalidInput(_))
         ));
     }
 }

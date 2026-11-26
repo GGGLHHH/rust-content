@@ -27,6 +27,10 @@ pub enum ContentError {
     #[error("invalid status: {0}")]
     InvalidStatus(String),
 
+    /// 调用方给的入参不合法(如 nil 租户 —— nil UUID 永远不是合法租户)。消息可回传。
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     /// 资源冲突:存活唯一索引 (storage_backend_name, object_key) 违例。消息写给用户、可回传。
     #[error("conflict: {0}")]
     Conflict(String),

@@ -4,7 +4,11 @@
 set dotenv-load := true
 
 # PG conformance 连 content role(search_path=content 由 role 配置继承)。默认指向 baserust 本地 compose 的 pg;
-# 第一次跑前在 baserust 里 `just pg-test-grant`(给 content 授 CREATEDB,#[sqlx::test] 要建临时库)。
+# 第一次跑前在 baserust 里 `just pg-test-grant`(给 content 授 CREATEDB,#[sqlx::test] 要建临时库),
+# 另外 content 要有 CREATEROLE:测试 bootstrap 会建一个 NOLOGIN、NOBYPASSRLS 的运行时账号 content_rt,
+# 仓储经 SET ROLE 用它跑,RLS 才真的生效。**只在一次性的测试库 / 测试容器上授**(超级用户执行
+# `alter role content createrole`),别在开发库(默认端口 5821)或任何长期库上授:运行时账号带 CREATEROLE
+# 等于能建账号、改别的账号的成员关系。测试容器换端口跑:`PG_PORT=<测试容器端口> just test-pg`。
 pg_url := env_var_or_default("DATABASE_URL", "postgres://" + env_var_or_default("CONTENT_DB_USER", "content") + ":" + env_var_or_default("CONTENT_DB_PASSWORD", "pwd") + "@" + env_var_or_default("PG_HOST", "localhost") + ":" + env_var_or_default("PG_PORT", "5821") + "/" + env_var_or_default("POSTGRES_DB", "baserust") + "?sslmode=disable")
 
 # 编译/clippy 实时反馈面板(面板内按 c/l/t 切 check/clippy/test)

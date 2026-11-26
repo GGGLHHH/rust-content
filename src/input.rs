@@ -1,6 +1,7 @@
 //! content 服务的领域输入(纯数据:无 HTTP / 序列化 / 校验)。
 //! HTTP 边界的反序列化 + 校验由消费方(app)做完,再 `.into()` 成这些结构传进 service。
 //! 审计主体(created_by/updated_by)不在输入里 —— 由 service 方法的 `by: Option<String>` 参数单独传。
+//! 租户也不在输入里 —— 由 service 方法的第一个参数 `scope: ContentScope` 给出。
 
 use bytes::Bytes;
 use uuid::Uuid;
@@ -8,7 +9,6 @@ use uuid::Uuid;
 /// 创建内容(仅建 content 行,不碰对象/字节)。
 #[derive(Debug, Clone)]
 pub struct CreateContentInput {
-    pub tenant_id: Uuid,
     pub owner_id: Uuid,
     pub owner_type: Option<String>,
     pub name: Option<String>,
@@ -30,13 +30,13 @@ pub struct UpdateContentInput {
 /// 一次性上传:建 content + object 行、推字节、同步元数据、翻状态(Go `UploadContent` 流)。
 #[derive(Debug, Clone)]
 pub struct UploadContentInput {
-    pub tenant_id: Uuid,
     pub owner_id: Uuid,
     pub owner_type: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub document_type: Option<String>,
-    /// 后端内的 key。`None` 则服务 mint 默认 `{content_id}/{uuid}`(不依赖 Go 的 objectkey 包)。
+    /// 后端内的 key(给了就原样用)。`None` 则服务按作用域 mint:租户 `tenants/{tenant_id}/{content_id}/{uuid}`、
+    /// 个人 `personal/{owner_id}/{content_id}/{uuid}`。
     pub object_key: Option<String>,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
@@ -51,13 +51,12 @@ pub struct UploadContentInput {
 /// **不复用** UploadContentInput:`data` 没有合法占位值,别用空 Bytes 骗类型。
 #[derive(Debug, Clone)]
 pub struct PrepareUploadInput {
-    pub tenant_id: Uuid,
     pub owner_id: Uuid,
     pub owner_type: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub document_type: Option<String>,
-    /// 后端内的 key。`None` 则服务 mint 默认 `{content_id}/{uuid}`。
+    /// 后端内的 key(给了就原样用)。`None` 则服务按作用域 mint(同 `UploadContentInput::object_key`)。
     pub object_key: Option<String>,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
