@@ -27,6 +27,8 @@ use crate::status::{ContentStatus, ObjectStatus};
 use crate::types::{Content, ContentMetadata, ContentScope, Object, ObjectMetadata};
 
 pub use memory::{InMemoryContentRepo, InMemoryObjectRepo};
+#[cfg(feature = "pg-conformance")]
+pub use postgres::scoped_tx;
 pub use postgres::{PgContentRepo, PgObjectRepo};
 
 /// 建内容的仓储输入(无 id/时间戳/状态:仓储 mint id、置 status=Created;租户取自 `scope`)。

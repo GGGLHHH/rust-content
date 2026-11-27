@@ -3,7 +3,7 @@
 //! `IN (...)` 批量、`AND deleted_at IS NULL` 软删过滤、存活唯一索引违例 → `Conflict`、server-side now()/触发器。
 //!
 //! **作用域(多租户)**:每个方法都是一个事务 —— [`scoped_tx`] 开事务、**第一条语句**用事务级
-//! `set_config(..., true)` 设上下文(租户:`app.tenant_id`;个人:`app.personal_scope = 'on'`),
+//! `set_config(..., true)` 设上下文(租户:`app.tenant_id`;个人:`app.personal_scope = 'on'`;另一个变量同时清成 `''`),
 //! 然后业务 SQL **同时**带作用域条件(`tenant_id = $1` / `tenant_id IS NULL`,走索引、也是内存实现的同一语义),
 //! 最后 commit。表上的 RLS(迁移 0003,ENABLE + FORCE)是第二道防线:忘了带条件也串不了租户。
 //! 不在借出连接时设会话级变量(以后加 PgBouncer 也不会串租户)。
@@ -42,19 +42,27 @@ fn map_unique(e: sqlx::Error, msg: &str) -> ContentError {
 
 /// 开一个带作用域的事务:校验作用域(nil 租户 → `InvalidInput`)→ `begin` →
 /// 第一条语句 `select set_config(..., true)`(事务级,commit / rollback 后自动失效)。
-async fn scoped_tx(
+///
+/// **两个变量一起设**:本作用域的那个设上,另一个显式清成 `''`。RLS 策略是「租户分支 OR 个人分支」,
+/// 连接上若有会话级残留(别的代码 / 连接池中间件 `set app.personal_scope = 'on'` 之类没清掉),只设本作用域的变量
+/// 会让另一支也放行 —— 租户事务里看得到个人内容,反之亦然。清成 `''`:租户分支 `nullif('', '')::uuid` 是 NULL、
+/// 个人分支要求 `= 'on'`,两支都不放行。
+///
+/// `pub` 只为 `pg-conformance` 测试经 `content::__pg_testing` 直接拿到它(本模块私有,平时不对外)。
+pub async fn scoped_tx(
     pool: &PgPool,
     scope: ContentScope,
 ) -> Result<Transaction<'static, Postgres>, ContentError> {
     scope.validate()?;
     let mut tx = pool.begin().await.map_err(internal)?;
     let q = match scope {
-        ContentScope::Tenant(id) => {
-            sqlx::query("select set_config('app.tenant_id', $1, true)").bind(id.to_string())
-        }
-        ContentScope::Personal => {
-            sqlx::query("select set_config('app.personal_scope', 'on', true)")
-        }
+        ContentScope::Tenant(id) => sqlx::query(
+            "select set_config('app.tenant_id', $1, true), set_config('app.personal_scope', '', true)",
+        )
+        .bind(id.to_string()),
+        ContentScope::Personal => sqlx::query(
+            "select set_config('app.personal_scope', 'on', true), set_config('app.tenant_id', '', true)",
+        ),
     };
     q.execute(&mut *tx).await.map_err(internal)?;
     Ok(tx)
@@ -533,12 +541,20 @@ impl ObjectRepo for PgObjectRepo {
         let mut tx = scoped_tx(&self.pool, scope).await?;
         // 先验父 content 在本作用域存活(同 set_metadata):object.content_id 的 FK 检查不受 RLS 约束,
         // 不验就能把对象挂到别的租户 / 个人作用域的 content 下;不存在的父行也该是 NotFound 而不是 FK 报 500。
+        //
+        // **`FOR SHARE` 锁住父行到本事务结束**,堵「检查通过 → 并发软删提交 → 插入」的竞态。
+        // 软删是改非键列的 UPDATE,拿的是 `FOR NO KEY UPDATE` 行锁;插 object 时 FK 检查只拿 `FOR KEY SHARE`,
+        // 和它不冲突,挡不住。`FOR SHARE` 是和 `FOR NO KEY UPDATE` 冲突的最弱一级:
+        // 软删在先 → 这里等它提交,READ COMMITTED 下重查最新版本发现 deleted_at 非空 → 不返回行 → NotFound;
+        // 这里在先 → 软删等本事务提交后再删(等价于「先建对象、后删内容」的串行顺序)。
+        // 不用 `FOR NO KEY UPDATE`:它和自己冲突,同一 content 下并发建对象会被无谓串行化;`FOR SHARE` 之间互相兼容。
         let (sql, values) = Query::select()
             .expr(Expr::val(1))
             .from(ContentTable::Table)
             .and_where(Expr::col(ContentTable::Id).eq(o.content_id))
             .and_where(scope_cond(ContentTable::TenantId, scope))
             .and_where(Expr::col(ContentTable::DeletedAt).is_null())
+            .lock_shared()
             .build_sqlx(PostgresQueryBuilder);
         sqlx::query_with::<Postgres, _>(AssertSqlSafe(sql), values)
             .fetch_optional(&mut *tx)

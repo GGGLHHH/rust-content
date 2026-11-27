@@ -42,3 +42,11 @@ pub use types::{
     Content, ContentMetadata, ContentScope, DerivedContent, Object, ObjectMetadata,
     DEFAULT_TENANT_ID,
 };
+
+/// **仅测试用**(`--features pg-conformance` 才编译):PG 一致性测试直接调仓储内部的 `scoped_tx`,
+/// 在它开的事务里跑不带作用域条件的 SQL,证明「只靠 RLS」也只放行本作用域的行。不是公开 API。
+#[cfg(feature = "pg-conformance")]
+#[doc(hidden)]
+pub mod __pg_testing {
+    pub use crate::repo::scoped_tx;
+}

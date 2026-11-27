@@ -35,8 +35,9 @@ pub struct UploadContentInput {
     pub name: Option<String>,
     pub description: Option<String>,
     pub document_type: Option<String>,
-    /// 后端内的 key(给了就原样用)。`None` 则服务按作用域 mint:租户 `tenants/{tenant_id}/{content_id}/{uuid}`、
-    /// 个人 `personal/{owner_id}/{content_id}/{uuid}`。
+    /// 后端内的 key。`None` 则服务按作用域 mint:租户 `tenants/{tenant_id}/{content_id}/{uuid}`、
+    /// 个人 `personal/{owner_id}/{content_id}/{uuid}`。给了就原样用,但必须以本作用域前缀开头
+    /// (租户 `tenants/{tenant_id}/`、个人 `personal/{owner_id}/`),前缀后非空、不含 `..` 段,否则 `InvalidInput`。
     pub object_key: Option<String>,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
@@ -56,7 +57,7 @@ pub struct PrepareUploadInput {
     pub name: Option<String>,
     pub description: Option<String>,
     pub document_type: Option<String>,
-    /// 后端内的 key(给了就原样用)。`None` 则服务按作用域 mint(同 `UploadContentInput::object_key`)。
+    /// 后端内的 key。`None` 则服务按作用域 mint;给了必须在本作用域前缀下(规则同 `UploadContentInput::object_key`)。
     pub object_key: Option<String>,
     pub file_name: Option<String>,
     pub mime_type: Option<String>,

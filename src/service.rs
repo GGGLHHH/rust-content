@@ -66,10 +66,32 @@ const DEFAULT_BACKEND_NAME: &str = "memory";
 /// 前缀让存储后端按租户 / 个人分目录(便于按前缀清理、配额、审计);已有对象的 key 存在库里,不搬家。
 fn mint_object_key(scope: ContentScope, owner_id: Uuid, content_id: Uuid) -> String {
     let leaf = Uuid::now_v7();
+    format!("{}{content_id}/{leaf}", object_key_prefix(scope, owner_id))
+}
+
+/// 本作用域的对象 key 前缀(带结尾 `/`):租户 `tenants/{tenant_id}/`,个人 `personal/{owner_id}/`。
+/// mint 和校验调用方显式给的 key 共用这一处。
+fn object_key_prefix(scope: ContentScope, owner_id: Uuid) -> String {
     match scope {
-        ContentScope::Tenant(t) => format!("tenants/{t}/{content_id}/{leaf}"),
-        ContentScope::Personal => format!("personal/{owner_id}/{content_id}/{leaf}"),
+        ContentScope::Tenant(t) => format!("tenants/{t}/"),
+        ContentScope::Personal => format!("personal/{owner_id}/"),
     }
+}
+
+/// 调用方显式给的 `object_key`:必须落在本作用域前缀下([`object_key_prefix`]),前缀后不能为空,
+/// 也不能有 `..` 段(按 `/` 和 `\` 切;防文件系统类后端把 `tenants/{A}/../{B}/x` 解析出前缀)。
+/// 否则 → `InvalidInput`。不校验的话,租户 A 传 `tenants/{B}/…` 就能把字节写进 / 覆盖 B 的目录。
+fn check_object_key(scope: ContentScope, owner_id: Uuid, key: &str) -> Result<(), ContentError> {
+    let prefix = object_key_prefix(scope, owner_id);
+    let rest = key.strip_prefix(prefix.as_str()).ok_or_else(|| {
+        ContentError::InvalidInput(format!("object_key must start with \"{prefix}\""))
+    })?;
+    if rest.is_empty() || rest.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err(ContentError::InvalidInput(format!(
+            "object_key must be a non-empty path under \"{prefix}\" without \"..\" segments"
+        )));
+    }
+    Ok(())
 }
 
 impl ContentService {
@@ -191,6 +213,10 @@ impl ContentService {
         input: UploadContentInput,
         by: Option<String>,
     ) -> Result<UploadOutcome, ContentError> {
+        // 步骤 0:显式给的 object_key 必须在本作用域前缀下(建行之前校验,拒了不留孤儿行)。
+        if let Some(key) = &input.object_key {
+            check_object_key(scope, input.owner_id, key)?;
+        }
         // 步骤 1:建 content 行(status=Created)。
         let content = self
             .inner
@@ -324,6 +350,10 @@ impl ContentService {
         input: PrepareUploadInput,
         by: Option<String>,
     ) -> Result<PrepareOutcome, ContentError> {
+        // 0) 显式给的 object_key 必须在本作用域前缀下(同一步上传步骤 0)。
+        if let Some(key) = &input.object_key {
+            check_object_key(scope, input.owner_id, key)?;
+        }
         // 1) content 行(同一步上传步骤 1)。
         let content = self
             .inner

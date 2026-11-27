@@ -668,7 +668,7 @@ fn assert_key(key: &str, prefix: &str, content_id: Uuid) {
 }
 
 /// 服务 mint 的对象 key 带作用域前缀:租户 `tenants/{tenant_id}/{content_id}/{uuid}`、
-/// 个人 `personal/{owner_id}/{content_id}/{uuid}`;调用方显式传的 key 原样保留。
+/// 个人 `personal/{owner_id}/{content_id}/{uuid}`;调用方显式传的、本作用域前缀下的 key 原样保留。
 async fn object_key_has_tenant_prefix_contract(
     contents: Arc<dyn ContentRepo>,
     objects: Arc<dyn ObjectRepo>,
@@ -714,22 +714,7 @@ async fn object_key_has_tenant_prefix_contract(
     assert_eq!(pu.content.tenant_id, None);
 
     let pr = svc
-        .prepare_upload(
-            ts,
-            PrepareUploadInput {
-                owner_id: owner,
-                owner_type: None,
-                name: None,
-                description: None,
-                document_type: None,
-                object_key: None,
-                file_name: None,
-                mime_type: None,
-                tags: vec![],
-                custom_metadata: None,
-            },
-            None,
-        )
+        .prepare_upload(ts, prepare_input(owner, None), None)
         .await
         .unwrap();
     assert_key(
@@ -738,13 +723,132 @@ async fn object_key_has_tenant_prefix_contract(
         pr.content.id,
     );
 
-    // 调用方给的 key 原样保留(不加前缀)
-    let custom = format!("custom/{}", Uuid::now_v7());
+    // 调用方给的、本作用域前缀下的 key 原样保留(不再加前缀)
+    let custom = format!("tenants/{t}/custom/{}", Uuid::now_v7());
     let cu = svc
         .upload_content(ts, upload_input(owner, Some(custom.clone())), None)
         .await
         .unwrap();
     assert_eq!(cu.object.object_key, custom);
+}
+
+fn prepare_input(owner: Uuid, object_key: Option<String>) -> PrepareUploadInput {
+    PrepareUploadInput {
+        owner_id: owner,
+        owner_type: None,
+        name: None,
+        description: None,
+        document_type: None,
+        object_key,
+        file_name: None,
+        mime_type: None,
+        tags: vec![],
+        custom_metadata: None,
+    }
+}
+
+/// 调用方显式给的 object_key 必须在本作用域前缀下(租户 `tenants/{tenant_id}/`、个人 `personal/{owner_id}/`):
+/// 租户 A 传 `tenants/{B}/x`、个人传别人的 `personal/{other}/x`、无前缀、`..` 越级、前缀后为空 → `InvalidInput`,
+/// 且被拒的请求**不留任何行**(校验在建行之前);一步上传和两步上传 prepare 同一规则。合法前缀照常可用。
+async fn explicit_object_key_must_have_scope_prefix_contract(
+    contents: Arc<dyn ContentRepo>,
+    objects: Arc<dyn ObjectRepo>,
+) {
+    let svc = ContentService::new(
+        contents.clone(),
+        objects,
+        Arc::new(InMemoryObjectStore::new()),
+        "memory",
+    );
+    let owner = Uuid::now_v7();
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let sa = ContentScope::tenant(a).unwrap();
+    let other_owner = Uuid::now_v7();
+
+    let bad_for_a = [
+        format!("tenants/{b}/x"),                // 别的租户的前缀
+        format!("tenants/{a}"),                  // 少了结尾 /,不算在前缀下
+        format!("tenants/{a}/"),                 // 前缀后为空
+        format!("tenants/{a}/../{b}/x"),         // .. 越级到 B
+        format!("tenants/{a}/x\\..\\..\\{b}/y"), // 反斜杠 .. 也拒
+        format!("personal/{owner}/x"),           // 个人前缀不能在租户作用域用
+        "x".to_owned(),                          // 无前缀
+    ];
+    for key in &bad_for_a {
+        assert!(
+            is_invalid(
+                svc.upload_content(sa, upload_input(owner, Some(key.clone())), None)
+                    .await
+            ),
+            "upload: 租户 A 用 {key} 应被拒"
+        );
+        assert!(
+            is_invalid(
+                svc.prepare_upload(sa, prepare_input(owner, Some(key.clone())), None)
+                    .await
+            ),
+            "prepare: 租户 A 用 {key} 应被拒"
+        );
+    }
+    let bad_for_personal = [
+        format!("personal/{other_owner}/x"), // 别人的个人前缀
+        format!("tenants/{a}/x"),            // 租户前缀不能在个人作用域用
+    ];
+    for key in &bad_for_personal {
+        assert!(
+            is_invalid(
+                svc.upload_content(
+                    ContentScope::Personal,
+                    upload_input(owner, Some(key.clone())),
+                    None
+                )
+                .await
+            ),
+            "upload: 个人作用域用 {key} 应被拒"
+        );
+        assert!(
+            is_invalid(
+                svc.prepare_upload(
+                    ContentScope::Personal,
+                    prepare_input(owner, Some(key.clone())),
+                    None
+                )
+                .await
+            ),
+            "prepare: 个人作用域用 {key} 应被拒"
+        );
+    }
+    // 被拒的请求一行都没建(校验先于建 content 行)
+    assert!(contents.list(sa, owner).await.unwrap().is_empty());
+    assert!(contents
+        .list(ContentScope::Personal, owner)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // 合法前缀:原样用
+    let ka = format!("tenants/{a}/mine/{}", Uuid::now_v7());
+    let up = svc
+        .upload_content(sa, upload_input(owner, Some(ka.clone())), None)
+        .await
+        .unwrap();
+    assert_eq!(up.object.object_key, ka);
+    let ka2 = format!("tenants/{a}/two-step/{}", Uuid::now_v7());
+    let pr = svc
+        .prepare_upload(sa, prepare_input(owner, Some(ka2.clone())), None)
+        .await
+        .unwrap();
+    assert_eq!(pr.object.object_key, ka2);
+    let kp = format!("personal/{owner}/avatar/{}", Uuid::now_v7());
+    let pu = svc
+        .upload_content(
+            ContentScope::Personal,
+            upload_input(owner, Some(kp.clone())),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pu.object.object_key, kp);
 }
 
 // ── 入口 1:内存(零 DB,默认 cargo test 就编译+跑)──
@@ -796,6 +900,15 @@ mod memory {
     #[tokio::test]
     async fn object_key_has_tenant_prefix() {
         object_key_has_tenant_prefix_contract(
+            Arc::new(InMemoryContentRepo::new()),
+            Arc::new(InMemoryObjectRepo::new()),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn explicit_object_key_must_have_scope_prefix() {
+        explicit_object_key_must_have_scope_prefix_contract(
             Arc::new(InMemoryContentRepo::new()),
             Arc::new(InMemoryObjectRepo::new()),
         )
@@ -990,6 +1103,19 @@ mod pg {
         .await;
     }
 
+    #[sqlx::test(migrations = false)]
+    async fn explicit_object_key_must_have_scope_prefix(
+        opts: PgPoolOptions,
+        conn: PgConnectOptions,
+    ) {
+        let p = bootstrap(opts, conn).await;
+        explicit_object_key_must_have_scope_prefix_contract(
+            Arc::new(PgContentRepo::new(p.rt.clone())),
+            Arc::new(PgObjectRepo::new(p.rt.clone())),
+        )
+        .await;
+    }
+
     /// 五张有 tenant_id 的表。
     const TABLES: [&str; 5] = [
         "content",
@@ -1006,6 +1132,246 @@ mod pg {
             .unwrap()
     }
 
+    /// `select count(*) from {table} where {cond}`,cond 里一个 `$1` 绑 uuid。
+    async fn count_where(conn: &mut sqlx::PgConnection, table: &str, cond: &str, v: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(AssertSqlSafe(format!(
+            "select count(*) from {table} where {cond}"
+        )))
+        .bind(v)
+        .fetch_one(conn)
+        .await
+        .unwrap()
+    }
+
+    /// [`seed_with_derived`] 铺完后每个租户在各表的行数(content 2 = 原件 + 派生件)。
+    const PER_TENANT_ROWS: [(&str, i64); 5] = [
+        ("content", 2),
+        ("content_metadata", 1),
+        ("object", 1),
+        ("object_metadata", 1),
+        ("content_derived", 1),
+    ];
+
+    /// [`seed_one`] + 一条派生件 content + 一行 content_derived(仓储没有派生接口,直接 SQL 在本租户上下文里写)。
+    /// 返回 (原件 content_id, 派生件 content_id)。
+    async fn seed_with_derived(
+        p: &Pools,
+        c: &PgContentRepo,
+        o: &PgObjectRepo,
+        scope: ContentScope,
+        owner: Uuid,
+    ) -> (Uuid, Uuid) {
+        let (parent, _, _) = seed_one(c, o, scope, owner).await;
+        let child = c
+            .create(scope, new_content(owner, "derived"), None)
+            .await
+            .unwrap()
+            .id;
+        let mut tx = p.rt.begin().await.unwrap();
+        set_tenant(&mut tx, scope.tenant_id().unwrap()).await;
+        sqlx::query(
+            "insert into content_derived (parent_id, content_id, variant, derivation_type, tenant_id)
+             values ($1, $2, 'thumb', 'resize', $3)",
+        )
+        .bind(parent)
+        .bind(child)
+        .bind(scope.tenant_id())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        (parent, child)
+    }
+
+    /// 单连接的运行时账号池,连上就留**会话级**残留(`set …`,不是 `set local`:事务结束也不清),
+    /// 模拟连接池里一条被别的代码 / 中间件弄脏的连接。
+    async fn residual_pool(conn: PgConnectOptions, residual: String) -> PgPool {
+        PgPoolOptions::new()
+            .max_connections(1)
+            .after_connect(move |c, _| {
+                let sql = format!("set role {RT_ROLE}; {residual}");
+                Box::pin(async move {
+                    c.execute(AssertSqlSafe(sql)).await?;
+                    Ok(())
+                })
+            })
+            .connect_with(conn)
+            .await
+            .expect("连带残留的运行时账号池")
+    }
+
+    async fn content_ids(conn: &mut sqlx::PgConnection) -> Vec<Uuid> {
+        sqlx::query_scalar("select id from content order by id")
+            .fetch_all(conn)
+            .await
+            .unwrap()
+    }
+
+    /// 连接上有会话级残留(`app.personal_scope = 'on'` + `app.tenant_id = B`)时,仓储的 `scoped_tx` 开的事务里
+    /// 用**不带作用域条件**的 SQL 查,RLS 仍只放行本作用域的行:租户 A 看不到个人行 / B 的行,个人作用域看不到 B 的行。
+    /// (修复前 `scoped_tx` 只设本作用域的变量,另一个残留会让 RLS 的另一支也放行。)
+    #[sqlx::test(migrations = false)]
+    async fn scoped_tx_ignores_session_residual_of_other_scope(
+        opts: PgPoolOptions,
+        conn: PgConnectOptions,
+    ) {
+        use content::__pg_testing::scoped_tx;
+        let p = bootstrap(opts, conn.clone()).await;
+        let (c, o) = repos(&p);
+        let (a, b) = (tenant(), tenant());
+        let (ta, tb) = (a.tenant_id().unwrap(), b.tenant_id().unwrap());
+        let owner = Uuid::now_v7();
+        let (ca, _, _) = seed_one(&c, &o, a, owner).await;
+        let (cb, _, _) = seed_one(&c, &o, b, owner).await;
+        let (cp, _, _) = seed_one(&c, &o, ContentScope::Personal, owner).await;
+
+        let dirty = residual_pool(
+            conn,
+            format!("set app.personal_scope = 'on'; set app.tenant_id = '{tb}'"),
+        )
+        .await;
+        // 前提:残留真的在这条连接上(不经 scoped_tx 直接查 → 看得见 B + 个人)
+        {
+            let mut x = dirty.acquire().await.unwrap();
+            let mut want = vec![cb, cp];
+            want.sort();
+            assert_eq!(content_ids(&mut x).await, want, "残留应已生效");
+        }
+
+        // 租户 A:只见 A(四张有数据的表都只 1 行,且没有非 A 的行)
+        let mut tx = scoped_tx(&dirty, a).await.unwrap();
+        assert_eq!(content_ids(&mut tx).await, vec![ca], "租户 A 只应见 A 的行");
+        for table in &TABLES[..4] {
+            assert_eq!(
+                count(&mut tx, table).await,
+                1,
+                "{table}: 租户 A 只应见 1 行"
+            );
+            assert_eq!(
+                count_where(&mut tx, table, "tenant_id is distinct from $1", ta).await,
+                0,
+                "{table}: 租户 A 不应见个人 / B 的行"
+            );
+        }
+        tx.rollback().await.unwrap();
+
+        // 个人:只见个人行
+        let mut tx = scoped_tx(&dirty, ContentScope::Personal).await.unwrap();
+        assert_eq!(
+            content_ids(&mut tx).await,
+            vec![cp],
+            "个人作用域只应见个人行"
+        );
+        for table in &TABLES[..4] {
+            assert_eq!(
+                count(&mut tx, table).await,
+                1,
+                "{table}: 个人作用域只应见 1 行"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(AssertSqlSafe(format!(
+                    "select count(*) from {table} where tenant_id is not null"
+                )))
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+                0,
+                "{table}: 个人作用域不应见任何租户行"
+            );
+        }
+        tx.rollback().await.unwrap();
+
+        // 仓储方法走同一个 scoped_tx:在脏连接上照常只回本作用域
+        let ca_repo = PgContentRepo::new(dirty.clone());
+        assert_eq!(
+            ca_repo
+                .list(a, owner)
+                .await
+                .unwrap()
+                .iter()
+                .map(|x| x.id)
+                .collect::<Vec<_>>(),
+            vec![ca]
+        );
+        assert!(is_not_found(ca_repo.get(a, cp).await));
+        assert!(is_not_found(ca_repo.get(ContentScope::Personal, cb).await));
+    }
+
+    /// 建对象的父行检查与并发软删的竞态:软删事务已改 deleted_at、未提交时并发 `objects.create`,
+    /// 父行检查的 `FOR SHARE` 必须**等**软删提交,然后重查到 deleted_at 非空 → NotFound,库里不留挂在已删内容下的对象。
+    /// (修复前检查不加锁,插入时的 FK 检查只拿 FOR KEY SHARE,不和软删的 FOR NO KEY UPDATE 冲突 → 不等、直接建成。)
+    #[sqlx::test(migrations = false)]
+    async fn object_create_waits_for_concurrent_parent_soft_delete(
+        opts: PgPoolOptions,
+        conn: PgConnectOptions,
+    ) {
+        let p = bootstrap(opts, conn).await;
+        let (c, _) = repos(&p);
+        let a = tenant();
+        let ta = a.tenant_id().unwrap();
+        let owner = Uuid::now_v7();
+        let parent = c
+            .create(a, new_content(owner, "parent"), None)
+            .await
+            .unwrap();
+
+        // 并发软删:改了 deleted_at、不提交(持有该行的 FOR NO KEY UPDATE 锁)
+        let mut del = p.rt.begin().await.unwrap();
+        set_tenant(&mut del, ta).await;
+        let n = sqlx::query("update content set deleted_at = now() where id = $1")
+            .bind(parent.id)
+            .execute(&mut *del)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 1);
+
+        let objs = PgObjectRepo::new(p.rt.clone());
+        let key = format!("tenants/{ta}/{}/x", parent.id);
+        let pid = parent.id;
+        let create = tokio::spawn(async move { objs.create(a, new_object(pid, &key), None).await });
+
+        // 等 create 卡在行锁上(本测试库里出现一个 wait_event_type = 'Lock' 的会话)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut waited = false;
+        while std::time::Instant::now() < deadline && !create.is_finished() {
+            let n: i64 = sqlx::query_scalar(
+                "select count(*) from pg_stat_activity
+                  where datname = current_database() and wait_event_type = 'Lock'",
+            )
+            .fetch_one(&p.owner)
+            .await
+            .unwrap();
+            if n > 0 {
+                waited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if !waited {
+            del.rollback().await.unwrap();
+            panic!(
+                "objects.create 应等并发软删提交(父行检查要加 FOR SHARE),实际没等: {:?}",
+                create.await.unwrap()
+            );
+        }
+        del.commit().await.unwrap();
+        let res = create.await.unwrap();
+        assert!(
+            matches!(res, Err(ContentError::NotFound)),
+            "软删提交后应重查到已删 → NotFound,实际 {res:?}"
+        );
+
+        // 库里没有挂在已删内容下的对象
+        let mut tx = p.rt.begin().await.unwrap();
+        set_tenant(&mut tx, ta).await;
+        assert_eq!(
+            count_where(&mut tx, "object", "content_id = $1", pid).await,
+            0
+        );
+        tx.rollback().await.unwrap();
+    }
+
     /// 直接 SQL:运行时账号不设 app.tenant_id / app.personal_scope → 每张表 0 行、写不进;
     /// 设了才看得到本作用域的行。顺带审计:运行时账号非 owner、无 BYPASSRLS,五张表都 ENABLE + FORCE RLS 且有策略。
     #[sqlx::test(migrations = false)]
@@ -1017,8 +1383,12 @@ mod pg {
         let (c, o) = repos(&p);
         let t = tenant();
         let tid = t.tenant_id().unwrap();
+        let b = tenant();
+        let tid_b = b.tenant_id().unwrap();
         let owner = Uuid::now_v7();
-        seed_one(&c, &o, t, owner).await;
+        // 两个租户各铺一整套(content_derived 也铺),外加一套个人内容
+        let seeded_a = seed_with_derived(&p, &c, &o, t, owner).await;
+        seed_with_derived(&p, &c, &o, b, owner).await;
         seed_one(&c, &o, ContentScope::Personal, owner).await;
 
         let mut rt = p.rt.acquire().await.unwrap();
@@ -1066,17 +1436,68 @@ mod pg {
             "应是 RLS 拒绝: {err}"
         );
 
-        // 设了租户:只看到本租户那一套(content/metadata/object/object_metadata 各 1)
+        // 设了租户 A:用**不带 tenant_id 条件**的 SQL 查,每张表都只见 A 自己那套
+        // (content 2 行 = 原件 + 派生件,其余各 1 行);B 的行、个人行一行都看不见 —— 只靠 RLS 隔开。
         let mut tx = sqlx::Acquire::begin(&mut *rt).await.unwrap();
         set_tenant(&mut tx, tid).await;
-        for table in &TABLES[..4] {
+        for (table, n) in PER_TENANT_ROWS {
             assert_eq!(
                 count(&mut tx, table).await,
-                1,
-                "{table} 设租户后应只见本租户 1 行"
+                n,
+                "{table} 设租户 A 后应只见 A 的 {n} 行"
+            );
+            assert_eq!(
+                count_where(&mut tx, table, "tenant_id is distinct from $1", tid).await,
+                0,
+                "{table}: A 的上下文里不该出现任何非 A 的行(B / 个人)"
             );
         }
         tx.commit().await.unwrap();
+        // B 的数据确实在库里(换到 B 的上下文,同样的 SQL 看得见),上面的 0 不是因为没铺数据
+        let mut tx = sqlx::Acquire::begin(&mut *rt).await.unwrap();
+        set_tenant(&mut tx, tid_b).await;
+        for (table, n) in PER_TENANT_ROWS {
+            assert_eq!(
+                count_where(&mut tx, table, "tenant_id = $1", tid_b).await,
+                n,
+                "{table}: B 的上下文应看到 B 的 {n} 行"
+            );
+        }
+        tx.commit().await.unwrap();
+        // 在 A 的上下文里写 tenant_id = B → WITH CHECK 拒(42501):插 content / content_derived、把 A 的行改成 B
+        let (ca, ca_child) = (seeded_a.0, seeded_a.1);
+        for (sql, binds) in [
+            (
+                "insert into content (id, tenant_id, owner_id) values ($1, $2, $3)",
+                vec![Uuid::now_v7(), tid_b, owner],
+            ),
+            (
+                "insert into content_derived (parent_id, content_id, variant, derivation_type, tenant_id)
+                 values ($1, $2, 'x', 'y', $3)",
+                vec![ca, ca_child, tid_b],
+            ),
+            (
+                "update content set tenant_id = $2 where id = $1",
+                vec![ca, tid_b],
+            ),
+        ] {
+            let mut tx = sqlx::Acquire::begin(&mut *rt).await.unwrap();
+            set_tenant(&mut tx, tid).await;
+            let mut q = sqlx::query(sql);
+            for b in binds {
+                q = q.bind(b);
+            }
+            let err = q
+                .execute(&mut *tx)
+                .await
+                .expect_err("A 的上下文里写 B 的 tenant_id 必须被拒");
+            assert_eq!(
+                sqlstate(&err).as_deref(),
+                Some("42501"),
+                "应是 RLS WITH CHECK 拒绝: {sql}: {err}"
+            );
+            tx.rollback().await.unwrap();
+        }
         // 事务级 set_config:提交后不残留(同一连接再查 → 0 行)
         assert_eq!(
             count(&mut rt, "content").await,

@@ -85,11 +85,16 @@ NOBYPASSRLS 的**,否则 RLS 形同虚设);每个调用点补上 `ContentScope`�
 | `Content.tenant_id: Option<Uuid>` | 原来是 `Uuid`;`None` = 个人内容(库里 NULL)。`Object` 等领域类型不暴露租户(库里子表各带 `tenant_id` 列) |
 | `*Input` 去掉 `tenant_id` 字段 | 租户只从 `ContentScope` 来,不再随输入结构传 |
 | `ContentError::InvalidInput(String)` | 新变体(nil 租户等非法入参)。消费方的 `From<ContentError>` 要加一支 |
-| 对象 key 格式 | 没传 `object_key` 时:租户 `tenants/{tenant_id}/{content_id}/{uuid}`,个人 `personal/{owner_id}/{content_id}/{uuid}`。已有对象的 key 不搬家 |
+| 对象 key 格式 | 没传 `object_key` 时:租户 `tenants/{tenant_id}/{content_id}/{uuid}`,个人 `personal/{owner_id}/{content_id}/{uuid}`。显式传的 `object_key` 必须以本作用域前缀开头(租户 `tenants/{tenant_id}/`、个人 `personal/{owner_id}/`),前缀后非空、不含 `..` 段,否则 `InvalidInput`(`upload_content` / `prepare_upload` 都校验,拒了不建行)。已有对象的 key 不搬家 |
 | 可见性 | 按 ID 取别的作用域的内容 → `NotFound`;两种作用域互不可见 |
-| PG 仓储 | 每个方法一个事务,先 `set_config('app.tenant_id', …, true)`(个人内容设 `app.personal_scope`)再查 |
+| PG 仓储 | 每个方法一个事务,先 `set_config('app.tenant_id', …, true)`(个人内容设 `app.personal_scope`)再查;另一个变量同时清成 `''`,连接上的会话级残留不会让 RLS 的另一支放行 |
 | 常量 `DEFAULT_TENANT_ID` | `00000000-0000-0000-0000-000000000001`(与 rust-idm / baserust 同值) |
 | 迁移 `0003_tenancy` | 子表加 `tenant_id` 并回填;旧行的租户(nil 或旧接口收下的任意客户端值)一律回填成默认租户;非 nil CHECK、`(tenant_id, …)` 索引;五张表 ENABLE + FORCE RLS |
+
+**已知影响(升级时一次性)**:`0003` 的回填是普通 `UPDATE`,会触发各表的 `set_updated_at` 触发器 ——
+升级前已有的行(`content`、`content_metadata`、`object`、`object_metadata`、`content_derived`)的 `updated_at`
+都会变成**跑迁移的那一刻**,原来的「最后修改时间」丢失(`created_at` 不受影响)。迁移已在已有库上执行过,不再改它;
+依赖 `updated_at` 做增量同步 / 排序的消费方,升级后第一次会把全部旧行当成刚改过。
 
 ## 测试
 
