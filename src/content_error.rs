@@ -4,10 +4,16 @@
 //! 把 Go 的 16 个 sentinel + 3 个上下文包装(ContentError/ObjectError/StorageError)收敛成一个精简枚举,
 //! 按 app 将映射的 HTTP 语义分组:not-found→404、state→409、bad-status→400、storage/internal→500。
 //! `Storage` 与 `Internal` 分开:app 可对后端错误(含 key/backend 上下文)单独落日志,但都不进响应体。
+//!
+//! 不实现 `Copy`(指南「Error types: Implement the Copy trait whenever possible」):
+//! 消息变体带 `String`、`Storage` / `Internal` 带 `anyhow::Error`,都不是 `Copy`。
 
+/// content 库所有操作的错误。`#[non_exhaustive]`:以后加变体不算破坏性变更,消费方 `match` 要留通配分支。
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+#[must_use]
 pub enum ContentError {
-    /// 资源不存在 / 已软删 / 无可下载对象。
+    /// 资源不存在 / 已软删 / 无可下载对象 / 属于别的作用域。
     /// (ErrContentNotFound / ErrObjectNotFound / ErrNoObjectsFound / ErrNoUploadedObjects → 404)
     #[error("resource not found")]
     NotFound,

@@ -1,0 +1,6 @@
+# 格式化配置:遵循 Google Rust 风格指南(https://google.github.io/styleguide/rustguide.html#formatting-other)。
+# 稳定版 rustfmt 能用的只有 max_width;指南另要求的三项(imports_granularity = "Module"、
+# hex_literal_case = "Lower"、format_macro_matchers = true)在稳定版上不可用,
+# 由 `just fmt` 应用、`just lint` 检查(两者都用 nightly rustfmt 带 --config,取值见 justfile 的 google_fmt),
+# CI 用 nightly --check 守。
+max_width = 100

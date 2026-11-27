@@ -3,7 +3,7 @@
 # 迁移表见 migrations/。镜像 rust-idm 的骨架:trait 端口 + 内存/PG 实现 + builder 服务 + 自有领域错误。
 [package]
 name = "content"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 description = "Self-contained content / media domain & service library: ContentService + pluggable repos + an ObjectStore blob port + its own ContentError. HTTP-agnostic — the consuming app owns routes, DTOs, validation and the S3/minio backend."
@@ -13,8 +13,6 @@ keywords = ["content", "blob", "storage", "media"]
 categories = ["filesystem"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-
 # serde_json:仅自由表单元数据(content_metadata.metadata / object_metadata.metadata 的 JSONB)用。
 # 无 HTTP / DTO 序列化 —— 领域类型不 derive Serialize/Deserialize。
 serde_json = "1"
@@ -27,14 +25,26 @@ tracing = "0.1"
 # 字节缓冲:upload/download 走 owned `Bytes`(非流式;流式是 DEFER 项)。
 bytes = "1"
 
-sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "macros", "time", "migrate", "json"] }
+# 关掉默认 feature(any / macros / migrate / json),只开库代码用到的:derive = 仓储的 `#[derive(sqlx::FromRow)]`,
+# json = JSONB 列解码成 serde_json::Value。sqlx::migrate!、#[sqlx::test] 只有测试用(见 [dev-dependencies]);
+# 迁移由消费方自己跑。
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "derive", "time", "json"] }
 sea-query = "1.0"
 # with-json:JSONB 列;postgres-array:TEXT[](tags)列。二者经 sea-query-sqlx 透传给 sea-query + sqlx。
 sea-query-sqlx = { version = "0.9", default-features = false, features = ["sqlx-postgres", "runtime-tokio", "tls-rustls", "with-uuid", "with-time", "with-json", "postgres-array"] }
 async-trait = "0.1"
 
-uuid = { version = "1", features = ["v4", "v7"] }
-time = { version = "0.3", features = ["serde-well-known"] }
+# v7:仓储生成的主键、服务生成的对象 key 叶子段。
+uuid = { version = "1", features = ["v7"] }
+time = "0.3"
+
+[dev-dependencies]
+# 库代码不直接用 tokio(运行时由消费方提供);只有 #[tokio::test]、文档示例和 PG 测试里的 spawn / sleep 用。
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# macros:#[sqlx::test];migrate:PG 一致性测试用 sqlx::migrate! 在临时库上跑迁移。
+sqlx = { version = "0.9", default-features = false, features = ["macros", "migrate"] }
+# 测试用 `time::macros::datetime!` 写固定时刻(注入固定时钟、断言落库时间戳;截到微秒 = PG timestamptz 精度)。
+time = { version = "0.3", features = ["macros"] }
 
 [features]
 # 同 idm/app:pg-conformance 开了才编译打真库的仓储一致性测试。
@@ -42,6 +52,23 @@ pg-conformance = []
 
 [lints.rust]
 unsafe_code = "forbid"
+# 指南「When and how to write documentation」:公开 API 都要有文档注释。
+missing_docs = "warn"
 
 [lints.clippy]
 all = "warn"
+# Google Rust 风格指南(https://google.github.io/styleguide/rustguide.html)里能交给 clippy 守的条目。
+# 阈值配置在 clippy.toml;unwrap_used 只对产品代码开(lib.rs 的 #![warn]),测试里的 panic 就是断言。
+# 类型、trait 导入后不带路径用;跨模块的函数用「模块名::函数名」调用(超过两段的路径 → 改成 use)。
+absolute_paths = "warn"
+# 纯函数 / 返回值不能丢的函数加 #[must_use]。
+must_use_candidate = "warn"
+return_self_not_must_use = "warn"
+# 会 panic 的公开函数在文档里写 # Panics。
+missing_panics_doc = "warn"
+# .clone() 不能代替借用。
+redundant_clone = "warn"
+# 指南「Apply #[non_exhaustive] to publicly-exposed enums / to public structs with public fields」。
+# 落在条款例外里的,就地 #[allow(..., reason = "…条款例外…")]。
+exhaustive_enums = "warn"
+exhaustive_structs = "warn"

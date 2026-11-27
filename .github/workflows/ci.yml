@@ -27,6 +27,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
+      # Google Rust 风格指南的三项 rustfmt 配置只有 nightly 支持(见 rustfmt.toml),单独用 nightly 查一遍。
+      # --config 的取值必须和 justfile 的 google_fmt 一致(just fmt / just lint 用的就是它),改一处要同步另一处。
+      - name: Format (Google style, nightly rustfmt)
+        run: |
+          rustup toolchain install nightly --profile minimal --component rustfmt
+          cargo +nightly fmt --all -- --check --config imports_granularity=Module,hex_literal_case=Lower,format_macro_matchers=true
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test

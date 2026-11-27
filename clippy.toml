@@ -1,0 +1,6 @@
+# clippy 阈值(配合 Cargo.toml [lints.clippy] 里为 Google Rust 风格指南开的 lint)。
+# 测试里的 unwrap / expect 就是断言(指南:Tests may use panics for assertions)。
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+# 最多两段:`mem::swap`、`Uuid::now_v7` 可以;`std::mem::swap`、`serde_json::Value::Null` 要先 use。
+absolute-paths-max-segments = 2

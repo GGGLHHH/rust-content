@@ -11,7 +11,7 @@ set dotenv-load := true
 # 等于能建账号、改别的账号的成员关系。测试容器换端口跑:`PG_PORT=<测试容器端口> just test-pg`。
 pg_url := env_var_or_default("DATABASE_URL", "postgres://" + env_var_or_default("CONTENT_DB_USER", "content") + ":" + env_var_or_default("CONTENT_DB_PASSWORD", "pwd") + "@" + env_var_or_default("PG_HOST", "localhost") + ":" + env_var_or_default("PG_PORT", "5821") + "/" + env_var_or_default("POSTGRES_DB", "baserust") + "?sslmode=disable")
 
-# 编译/clippy 实时反馈面板(面板内按 c/l/t 切 check/clippy/test)
+# 编译/clippy 实时反馈面板(bacon 默认键位:面板内按 c 切 clippy、t 切 test、d 开文档)
 watch:
     bacon clippy
 
@@ -33,16 +33,23 @@ test-all: test test-pg
 # lint:格式检查 + clippy(警告即失败)
 lint:
     cargo fmt --all -- --check
+    cargo +nightly fmt --all -- --check --config {{google_fmt}}
     cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # 自动格式化
 fmt:
     cargo fmt --all
+    cargo +nightly fmt --all -- --config {{google_fmt}}
+
+# Google Rust 风格指南要求、但只有 nightly rustfmt 支持的三项(稳定版只有 rustfmt.toml 里的 max_width)。
+# 和 .github/workflows/ci.yml 里 nightly fmt 那一步的 --config 必须一致,改一处要同步另一处。
+google_fmt := "imports_granularity=Module,hex_literal_case=Lower,format_macro_matchers=true"
 
 # 自动修复:clippy 机器可应用的建议自动改 + 格式化
 fix:
     cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets --all-features
     cargo fmt --all
+    cargo +nightly fmt --all -- --config {{google_fmt}}
 
 # 清理本 crate 的编译产物与增量缓存(保留依赖缓存)
 clean:
